@@ -4,7 +4,8 @@ import System.IO
 import System.Environment
 import Control.Monad
 import Data.Char (isLetter, isDigit)
-import Text.ParserCombinators.Parsec
+import Text.Parsec
+import Text.Parsec.Char
 import Data.Functor.Foldable
 import Numeric
 
@@ -35,25 +36,25 @@ data Type = TermType Type Type
           | UsrType String
           | TypeErr String deriving (Show)
 
-series :: CharParser () String -> CharParser () a -> CharParser () [a]
+series :: Parsec String () String -> Parsec String () a -> Parsec String () [a]
 series separator parser = sepBy (parser <* spaces) (separator <* spaces)
 
-space_series :: CharParser () a -> CharParser () [a]
+space_series :: Parsec String () a -> Parsec String () [a]
 space_series parser = series (many $ oneOf " \n\t\r") parser
 
-data_type :: CharParser () Type
+data_type :: Parsec String () Type
 data_type = descend <$> (series (string "->") expansion)
   where descend :: [Type] -> Type
         descend [] = TypeErr "invalid type"
         descend [x] = x
         descend (x:xs) = TermType x $ descend xs
 
-        expansion :: CharParser () Type
+        expansion :: Parsec String () Type
         expansion = (char '(' *> data_type <* char ')')
                 <|> type_atom
                 <?> "valid term type or atom type"
 
-type_atom :: CharParser () Type
+type_atom :: Parsec String () Type
 type_atom = Chr <$ (try $ string "char")
         <|> Bl <$ (try $ string "bool")
         <|> F64 <$ (try $ string "double")
@@ -75,24 +76,24 @@ iden_chars = ['a'..'z'] ++ ['A'..'Z'] ++ "_"
 iden_chars_rest :: String
 iden_chars_rest = iden_chars ++ ['0'..'9']
 
-identifier :: CharParser () String
+identifier :: Parsec String () String
 identifier = (:) <$> (oneOf iden_chars)
                  <*> (many $ oneOf $ iden_chars_rest)
 
-term :: CharParser () Term
+term :: Parsec String () Term
 term = Term <$> data_type
             <*> (identifier <* spaces)
             <*> (space_series identifier)
             <*> (char '=' *> spaces *> expression)
 
-expression :: CharParser () Expression
+expression :: Parsec String () Expression
 expression = (Block <$> (char '{' *> spaces *> (many (expression <* spaces)) <* spaces <* char '}'))
          <|> (Closure <$> try term)
          <|> (applChain <$> (searchTerm <* spaces <* char ';'))
-  where subexpression :: CharParser () Expression
+  where subexpression :: Parsec String () Expression
         subexpression = (applChain <$> (char '(' *> spaces *> searchTerm <* spaces <* char ')'))
                     <|> (BoundName <$> identifier)
-        searchTerm :: CharParser () [Expression]
+        searchTerm :: Parsec String () [Expression]
         searchTerm = many1 (subexpression <* spaces)
         applChain :: [Expression] -> Expression
         applChain a = (descend . reverse) a
@@ -100,7 +101,7 @@ expression = (Block <$> (char '{' *> spaces *> (many (expression <* spaces)) <* 
                 descend [x] = x
                 descend (x:xs) = Application (descend xs) x
 
-programFile :: CharParser () [Term]
+programFile :: Parsec String () [Term]
 programFile = many (spaces *> term <* spaces)
 
 parseProgram :: String -> IO ()
