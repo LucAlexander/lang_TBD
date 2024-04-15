@@ -9,9 +9,8 @@ import Text.Parsec.Char
 import Data.Functor.Foldable
 import Numeric
 
-type Program = ([Module], [Term])
+data Program = Program [Module] [Term] deriving (Show)
 type Scope = [Expression]
-type Module = String
 type Binding = String
 
 data Term = Term {
@@ -35,6 +34,13 @@ data Type = TermType Type Type
           | Bl
           | UsrType String
           | TypeErr String deriving (Show)
+
+data Module = Include Filename deriving (Show)
+
+type Filename = String
+
+suffix :: String
+suffix = ".idk"
 
 series :: Parsec String () String -> Parsec String () a -> Parsec String () [a]
 series separator parser = sepBy (parser <* spaces) (separator <* spaces)
@@ -101,14 +107,21 @@ expression = (Block <$> (char '{' *> spaces *> (many (expression <* spaces)) <* 
                 descend [x] = x
                 descend (x:xs) = Application (descend xs) x
 
-programFile :: Parsec String () [Term]
-programFile = many (spaces *> term <* spaces)
+include :: Parsec String () Module
+include = Include <$> (string "include" *> spaces *> filename <* spaces <* char ';' <* spaces)
+
+filename :: Parsec String () String
+filename = (++) <$> (many $ oneOf iden_chars_rest)
+                <*> string suffix
+
+programFile :: Parsec String () Program
+programFile = Program <$> (many include) <*> (many (spaces *> term <* spaces))
 
 parseProgram :: String -> IO ()
 parseProgram program =
   case parse programFile "(unknown)" program of
        Left e -> putStrLn "Parse Error" >> print e
-       Right r -> mapM_ print r
+       Right (Program m d) -> mapM_ print m >> mapM_ print d
 
 main :: IO ()
 main = getArgs >>= \args ->
