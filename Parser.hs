@@ -9,7 +9,7 @@ import Text.Parsec.Char
 import Data.Functor.Foldable
 import Numeric
 
-data Program = Program [Module] [Alias] [Term] deriving (Show)
+data Program = Program [Module] [Data] [Alias] [Term] deriving (Show)
 type Scope = [Expression]
 type Binding = String
 
@@ -19,8 +19,6 @@ data Term = Term {
     agumentNames :: [Binding],
     evaluation :: Expression
 } deriving (Show)
-
-data Alias = Alias Type Type deriving (Show)
 
 data Expression = Closure Term
                 | Application Expression Expression
@@ -37,8 +35,15 @@ data Type = TermType Type Type
           | UsrType String
           | TypeErr String deriving (Show)
 
+data Data = Product String [Data]
+          | Sum String [Data]
+          | Record Type String deriving (Show)
+
+data Alias = Alias String Type deriving (Show)
+
 data Definition = TermDef Term
-                | AliasDef Alias deriving (Show)
+                | AliasDef Alias
+                | DataDef Data deriving (Show)
 
 data Module = Include Filename deriving (Show)
 
@@ -119,21 +124,34 @@ filename :: Parsec String () String
 filename = (++) <$> (many $ oneOf iden_chars_rest)
                 <*> string suffix
 
-type_alias :: Parsec String () Alias
-type_alias = Alias <$> (string "type" *> spaces *> data_type <* spaces)
-                  <*> (char '=' *> spaces *> data_type <* spaces <* char ';')
+alias_definition :: Parsec String () Alias
+alias_definition = Alias <$> (string "type" *> spaces *> (identifier <* spaces <* char '=' <* spaces))
+                         <*> (data_type <* spaces <* char ';')
+
+data_definition :: Parsec String () Data
+data_definition = (string "data") *> spaces *> adt
+  where adt :: Parsec String () Data
+        adt = try (Product <$> typename <*> (lbrack *> (series (string "|") adt) <* rbrack))
+          <|> Sum <$> typename <*> ((lbrack *> many ((record <* spaces)) <* rbrack) <|> (pure []))
+        record :: Parsec String () Data
+        record = Record <$> (data_type <* spaces) <*> (identifier <* spaces <* char ';')
+        typename = identifier <* spaces
+        lbrack = (char '{') *> spaces
+        rbrack = spaces <* (char '}')
 
 programFile :: Parsec String () Program
-programFile = categorize <$> (Program <$> (many include) <*> pure [] <*> pure [])
+programFile = categorize <$> (Program <$> (many include) <*> pure [] <*> pure [] <*> pure [])
                          <*> (many definitions)
   where categorize :: Program -> [Definition] -> Program
         categorize p [] = p
-        categorize (Program mods als trms) [x] =
-          case x of AliasDef a -> Program mods (a:als) trms
-                    TermDef t -> Program mods als (t:trms)
+        categorize (Program mods dat als trms) [x] =
+          case x of DataDef d -> Program mods (d:dat) als trms
+                    AliasDef a -> Program mods dat (a:als) trms
+                    TermDef t -> Program mods dat als (t:trms)
         categorize p (x:xs) = categorize (categorize p [x]) xs
         definitions :: Parsec String () Definition
-        definitions = (AliasDef <$> (spaces *> type_alias <* spaces))
+        definitions = (DataDef <$> try (spaces *> data_definition <* spaces))
+                  <|> (AliasDef <$> try (spaces *> alias_definition <* spaces))
                   <|> (TermDef <$> (spaces *> term <* spaces))
 
 parseProgram :: String -> IO ()
@@ -141,9 +159,10 @@ parseProgram program =
   case parse programFile "(unknown)" program of
        Left e -> putStrLn "Parse Error"
               >> print e
-       Right (Program m a t) -> mapM_ print m
-                             >> mapM_ print a
-                             >> mapM_ print t
+       Right (Program m d a t) -> mapM_ print m
+                               >> mapM_ print d
+                               >> mapM_ print a
+                               >> mapM_ print t
 
 main :: IO ()
 main = getArgs >>= \args ->
