@@ -24,6 +24,8 @@ data Expression = Closure Term
                 | Application Expression Expression
                 | BoundName Binding
                 | Block Scope
+                | If Expression Expression Expression
+                | Else Expression
                 | Nop deriving (Show)
 
 data Type = TermType Type Type
@@ -103,7 +105,8 @@ term = Term <$> data_type
             <*> (char '=' *> spaces *> expression)
 
 expression :: Parsec String () Expression
-expression = (Block <$> (char '{' *> spaces *> (many (expression <* spaces)) <* spaces <* char '}'))
+expression = control_flow
+         <|> (Block <$> (char '{' *> spaces *> (many (expression <* spaces)) <* spaces <* char '}'))
          <|> (Closure <$> try term)
          <|> (applChain <$> (searchTerm <* spaces <* char ';'))
   where subexpression :: Parsec String () Expression
@@ -116,6 +119,17 @@ expression = (Block <$> (char '{' *> spaces *> (many (expression <* spaces)) <* 
           where descend :: [Expression] -> Expression
                 descend [x] = x
                 descend (x:xs) = Application (descend xs) x
+
+--control_flow :: Parsec String () Expression
+--control_flow = If <$> (string "if" *> spaces *> expression)
+--                  <*> (spaces *> expression)
+--                  <*> ((Else <$> (string "else" *> spaces *> expression)) <|> pure Nop)
+--
+
+control_flow :: Parsec String () Expression
+control_flow = If <$> try (string "if" *> spaces *> expression)
+                  <*> (spaces *> expression)
+                  <*> ((Else <$> (try (spaces *> string "else" *> spaces *> expression))) <|> (pure Nop))
 
 include :: Parsec String () Module
 include = Include <$> (string "include" *> spaces *> filename <* spaces <* char ';' <* spaces)
@@ -140,7 +154,7 @@ data_definition = (string "data") *> spaces *> adt
         rbrack = spaces <* (char '}')
 
 programFile :: Parsec String () Program
-programFile = categorize <$> (Program <$> (many include) <*> pure [] <*> pure [] <*> pure [])
+programFile = categorize <$> (Program <$> (many (try include)) <*> pure [] <*> pure [] <*> pure [])
                          <*> (many definitions)
   where categorize :: Program -> [Definition] -> Program
         categorize p [] = p
