@@ -102,34 +102,42 @@ term :: Parsec String () Term
 term = Term <$> data_type
             <*> (identifier <* spaces)
             <*> (space_series identifier)
-            <*> (char '=' *> spaces *> expression)
+            <*> (char '=' *> spaces *> term_set <* spaces)
+  where term_set = block_expression <|> control_flow <|> application_expression
+
+block_expression :: Parsec String () Expression
+block_expression = (Block <$> (char '{' *> spaces *> (many expression) <* spaces <* char '}'))
+
+application_expression :: Parsec String () Expression
+application_expression = applChain <$> (application <* (char ';' <* spaces))
+
+predicate :: Parsec String () Expression
+predicate = applChain <$> application
+
+application :: Parsec String () [Expression]
+application = many1 (subexpr <* spaces)
+  where subexpr :: Parsec String () Expression
+        subexpr = (applChain <$> (char '(' *> spaces *> application <* spaces <* char ')'))
+              <|> (BoundName <$> identifier)
+
+applChain :: [Expression] -> Expression
+applChain a = (descend . reverse) a
+  where descend :: [Expression] -> Expression
+        descend [x] = x
+        descend (x:xs) = Application (descend xs) x
 
 expression :: Parsec String () Expression
 expression = control_flow
-         <|> (Block <$> (char '{' *> spaces *> (many (expression <* spaces)) <* spaces <* char '}'))
+         <|> block_expression
          <|> (Closure <$> try term)
-         <|> (applChain <$> (searchTerm <* spaces <* char ';'))
-  where subexpression :: Parsec String () Expression
-        subexpression = (applChain <$> (char '(' *> spaces *> searchTerm <* spaces <* char ')'))
-                    <|> (BoundName <$> identifier)
-        searchTerm :: Parsec String () [Expression]
-        searchTerm = many1 (subexpression <* spaces)
-        applChain :: [Expression] -> Expression
-        applChain a = (descend . reverse) a
-          where descend :: [Expression] -> Expression
-                descend [x] = x
-                descend (x:xs) = Application (descend xs) x
-
---control_flow :: Parsec String () Expression
---control_flow = If <$> (string "if" *> spaces *> expression)
---                  <*> (spaces *> expression)
---                  <*> ((Else <$> (string "else" *> spaces *> expression)) <|> pure Nop)
---
+         <|> application_expression
 
 control_flow :: Parsec String () Expression
-control_flow = If <$> try (string "if" *> spaces *> expression)
-                  <*> (spaces *> expression)
-                  <*> ((Else <$> (try (spaces *> string "else" *> spaces *> expression))) <|> (pure Nop))
+control_flow = If <$> try (string "if" *> spaces *> predicate <* spaces) -- replace with predicate
+                  <*> (spaces *> block_expression <* spaces)
+                  <*> ((Else <$> (try (spaces *> string "else" *> spaces *> elsexpr <* spaces))) <|> (pure Nop))
+  where elsexpr :: Parsec String () Expression
+        elsexpr = control_flow <|> block_expression <|> application_expression
 
 include :: Parsec String () Module
 include = Include <$> (string "include" *> spaces *> filename <* spaces <* char ';' <* spaces)
