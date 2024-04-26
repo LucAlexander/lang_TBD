@@ -26,7 +26,13 @@ data Expression = Closure Term
                 | Block Scope
                 | If Expression Expression Expression
                 | Else Expression
+                | Case Expression [Match]
                 | Nop deriving (Show)
+
+data Match = Match Pattern Expression deriving (Show)
+
+data Pattern = Shape [Pattern]
+             | Anchor Binding deriving (Show)
 
 data Type = TermType Type Type
           | I8 | I16 | I32 | I64
@@ -133,11 +139,26 @@ expression = control_flow
          <|> application_expression
 
 control_flow :: Parsec String () Expression
-control_flow = If <$> try (string "if" *> spaces *> predicate <* spaces) -- replace with predicate
+control_flow = If <$> try (string "if" *> spaces *> predicate <* spaces)
                   <*> (spaces *> block_expression <* spaces)
                   <*> ((Else <$> (try (spaces *> string "else" *> spaces *> elsexpr <* spaces))) <|> (pure Nop))
+           <|> Case <$> (try (string "case" *> spaces *> predicate <* spaces))
+                    <*> (spaces *> match_block <* spaces)
   where elsexpr :: Parsec String () Expression
         elsexpr = control_flow <|> block_expression <|> application_expression
+
+match_block :: Parsec String () [Match]
+match_block = (char '{' *> spaces) *> (many1 match) <* (spaces <* char '}')
+
+match :: Parsec String () Match
+match = Match <$> (pattern <* spaces) <*> (string "->" *> spaces *> match_set <* spaces)
+  where match_set :: Parsec String () Expression
+        match_set = control_flow
+                <|> block_expression
+                <|> application_expression
+
+pattern :: Parsec String () Pattern
+pattern = Anchor <$> identifier -- TODO
 
 include :: Parsec String () Module
 include = Include <$> (string "include" *> spaces *> filename <* spaces <* char ';' <* spaces)
