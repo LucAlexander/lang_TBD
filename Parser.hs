@@ -6,6 +6,7 @@ import Control.Monad
 import Data.Char (isLetter, isDigit)
 import Text.Parsec
 import Text.Parsec.Char
+import Text.ParserCombinators.Parsec.Number
 import Data.Functor.Foldable
 import Numeric
 
@@ -16,7 +17,7 @@ type Binding = String
 data Term = Term {
     typeCons :: Type,
     name :: Binding,
-    agumentNames :: [Binding],
+    agumentNames :: [Pattern],
     evaluation :: Expression
 } deriving (Show)
 
@@ -27,13 +28,15 @@ data Expression = Closure Term
                 | If Expression Expression Expression
                 | Else Expression
                 | Case Expression [Match]
+                | LiteralPattern Pattern
                 | Nop deriving (Show)
 
 data Match = Match Pattern Expression deriving (Show)
 
 data Pattern = Shape [Pattern]
              | ReferenceShape Binding [Pattern]
-             | TypeAnchor Binding
+             | TypeAnchor CustomType
+             | LitAnchor Literal
              | Anchor Binding deriving (Show)
 
 data Type = TermType Type Type
@@ -42,8 +45,10 @@ data Type = TermType Type Type
           | F32 | F64
           | Chr
           | Bl
-          | UsrType String
+          | UsrType CustomType
           | TypeErr String deriving (Show)
+
+type CustomType = String
 
 data Data = Product String [Data]
           | Sum String [Data]
@@ -54,6 +59,11 @@ data Alias = Alias String Type deriving (Show)
 data Definition = TermDef Term
                 | AliasDef Alias
                 | DataDef Data deriving (Show)
+
+data Literal = Integral Int
+             | Float Double
+             | CharString String
+             | CharSingle Char deriving (Show)
 
 data Module = Include Filename deriving (Show)
 
@@ -93,23 +103,37 @@ type_atom = Chr <$ (try $ string "char")
         <|> U16 <$ (try $ string "uint16")
         <|> U32 <$ (try $ string "uint32")
         <|> U64 <$ (try $ string "uint64")
-        <|> UsrType <$> (try identifier)
+        <|> UsrType <$> (try adt_name)
         <|> TypeErr <$> (many $ oneOf $ iden_chars_rest)
 
 iden_chars :: String
-iden_chars = ['a'..'z'] ++ ['A'..'Z'] ++ "_"
+iden_chars = ['a'..'z'] ++ "_"
 
 iden_chars_rest :: String
-iden_chars_rest = iden_chars ++ ['0'..'9']
+iden_chars_rest = iden_chars ++ ['0'..'9'] ++ ['A'..'Z']
 
 identifier :: Parsec String () String
 identifier = (:) <$> (oneOf iden_chars)
                  <*> (many $ oneOf $ iden_chars_rest)
 
+adt_name :: Parsec String () String
+adt_name = (:) <$> oneOf ['A'..'Z']
+               <*> (many $ oneOf $ iden_chars_rest)
+
+comment :: Parsec String () String
+comment = (try $ string "//" *> (many anyChar) <* char '\n')
+      <|> (try $ string "/*" *> (many anyChar) <* string "*/")
+
+literal :: Parsec String () Literal
+literal = (CharString <$> try (char '"' *> (many anyChar) <* char '"')) -- TODO escape characters
+      <|> (CharSingle <$> try (char '\'' *> anyChar <* char '\''))
+      <|> (Float <$> try floating)
+      <|> (Integral <$> try int)
+
 term :: Parsec String () Term
 term = Term <$> data_type
             <*> (identifier <* spaces)
-            <*> (space_series identifier)
+            <*> (space_series pattern)
             <*> (char '=' *> spaces *> term_set <* spaces)
   where term_set = block_expression <|> control_flow <|> application_expression
 
@@ -126,6 +150,7 @@ application :: Parsec String () [Expression]
 application = many1 (subexpr <* spaces)
   where subexpr :: Parsec String () Expression
         subexpr = (applChain <$> (char '(' *> spaces *> application <* spaces <* char ')'))
+              <|> (LiteralPattern <$> pattern)
               <|> (BoundName <$> identifier)
 
 applChain :: [Expression] -> Expression
@@ -163,14 +188,15 @@ pattern :: Parsec String () Pattern
 pattern = (ReferenceShape <$> (try (identifier <* (spaces *> char '@' <* spaces)))
                           <*> grouping)
       <|> (Shape <$> (unbounded <|> grouping))
+      <|> LitAnchor <$> literal
       <|> Anchor <$> identifier
   where grouping :: Parsec String () [Pattern]
-        grouping = (char '(' *> spaces) *> unbounded <* (spaces <* char ')')
+        grouping = (char '(' *> spaces) *> (((:) <$> pattern <*> pure []) <|> unbounded) <* (spaces <* char ')')
         unbounded :: Parsec String () [Pattern]
-        unbounded = (:) <$> placeholder
+        unbounded = (:) <$> typeMatch
                         <*> (many (pattern <* spaces))
-        placeholder :: Parsec String () Pattern
-        placeholder = TypeAnchor <$> (identifier <* spaces) -- needs special rule, also applied elsewhere
+        typeMatch :: Parsec String () Pattern
+        typeMatch = TypeAnchor <$> (adt_name <* spaces)
 
 include :: Parsec String () Module
 include = Include <$> (string "include" *> spaces *> filename <* spaces <* char ';' <* spaces)
@@ -180,7 +206,7 @@ filename = (++) <$> (many $ oneOf iden_chars_rest)
                 <*> string suffix
 
 alias_definition :: Parsec String () Alias
-alias_definition = Alias <$> (string "type" *> spaces *> (identifier <* spaces <* char '=' <* spaces))
+alias_definition = Alias <$> (string "type" *> spaces *> (adt_name <* spaces <* char '=' <* spaces))
                          <*> (data_type <* spaces <* char ';')
 
 data_definition :: Parsec String () Data
@@ -190,7 +216,7 @@ data_definition = (string "data") *> spaces *> adt
           <|> Sum <$> typename <*> ((lbrack *> many ((record <* spaces)) <* rbrack) <|> (pure []))
         record :: Parsec String () Data
         record = Record <$> (data_type <* spaces) <*> (identifier <* spaces <* char ';')
-        typename = identifier <* spaces
+        typename = adt_name <* spaces
         lbrack = (char '{') *> spaces
         rbrack = spaces <* (char '}')
 
@@ -214,9 +240,9 @@ parseProgram program =
   case parse programFile "(unknown)" program of
        Left e -> putStrLn "Parse Error"
               >> print e
-       Right (Program m d a t) -> mapM_ print m
-                               >> mapM_ print d
-                               >> mapM_ print a
+       Right (Program m d a t) -> mapM_ print m >> (putStrLn "\n")
+                               >> mapM_ print d >> (putStrLn "\n")
+                               >> mapM_ print a >> (putStrLn "\n")
                                >> mapM_ print t
 
 main :: IO ()
