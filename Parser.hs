@@ -10,15 +10,21 @@ import Text.ParserCombinators.Parsec.Number
 import Data.Functor.Foldable
 import Numeric
 
-data Program = Program [Module] [Data] [Alias] [Term] deriving (Show)
+data Program = Program [Module] [TypeClass] [Data] [Alias] [Term] deriving (Show)
 type Scope = [Expression]
 type Binding = String
 
 data Term = Term {
     typeCons :: Type,
-    name :: Binding,
+    termName :: Binding,
     agumentNames :: [Pattern],
     evaluation :: Expression
+} deriving (Show)
+
+data TypeClass = TypeClass {
+    typeclassDependencies :: [Binding],
+    typeClassName :: Binding,
+    members :: [(Type, Binding)]
 } deriving (Show)
 
 data Expression = Closure Term
@@ -53,12 +59,13 @@ type CustomType = String
 
 data Data = Product String [Data]
           | Sum String [Data]
-          | Record Type String deriving (Show)
+          | Record Type Binding deriving (Show)
 
 data Alias = Alias String Type deriving (Show)
 
 data Definition = TermDef Term
                 | AliasDef Alias
+                | TypeClassDef TypeClass
                 | DataDef Data deriving (Show)
 
 data Literal = Integral Int
@@ -118,7 +125,7 @@ identifier = (:) <$> (oneOf iden_chars)
                  <*> (many $ oneOf $ iden_chars_rest)
 
 operator_identifier :: Parsec String () String
-operator_identifier = try $ many1 $ oneOf "!@#$%^&*-+<>?~:|"
+operator_identifier = try $ many1 $ oneOf "<>|!^*&#-+%$~?"
 
 adt_name :: Parsec String () String
 adt_name = (:) <$> oneOf ['A'..'Z']
@@ -131,11 +138,10 @@ comment = (try $ string "//" *> (many anyChar) <* char '\n')
 literal :: Parsec String () Literal
 literal = (CharString <$> try (char '"' *> many charac <* char '"'))
       <|> (CharSingle <$> try (char '\'' *> anyChar <* char '\''))
-      <|> (Float <$> try floating)
+      <|> (Float <$> try (ap sign floating))
       <|> (Integral <$> try int)
   where charac :: Parsec String () Char
         charac = (noneOf "\\\"\0\n\r\v\t\b\f") -- TODO excapes?
-
 
 term :: Parsec String () Term
 term = Term <$> data_type
@@ -158,8 +164,8 @@ application = many1 (subexpr <* spaces)
   where subexpr :: Parsec String () Expression
         subexpr = (applChain <$> (char '(' *> spaces *> application <* spaces <* char ')'))
               <|> (BoundName <$> identifier)
-              <|> (BoundOperator <$> operator_identifier)
               <|> (LiteralPattern <$> pattern)
+              <|> (BoundOperator <$> operator_identifier)
 
 applChain :: [Expression] -> Expression
 applChain a = (descend . reverse) a
@@ -217,6 +223,21 @@ alias_definition :: Parsec String () Alias
 alias_definition = Alias <$> (string "type" *> spaces *> (adt_name <* spaces <* char '=' <* spaces))
                          <*> (data_type <* spaces <* char ';')
 
+typeclass_definition :: Parsec String () TypeClass
+typeclass_definition = TypeClass <$> (string "typeclass" *> spaces *> depends <* spaces)
+                                 <*> adt_name
+                                 <*> members
+  where depends :: Parsec String () [Binding]
+        depends = ((char '(' *> spaces)
+                *> (series (string "," ) adt_name)
+                <* (spaces *> char ')' *> spaces *> string "=>"))
+              <|> (pure [])
+        members :: Parsec String () [(Type, Binding)]
+        members = (spaces *> char '{' *> spaces)
+               *> space_series ((,) <$> data_type
+                                    <*> ((identifier <|> operator_identifier) <* spaces <* char ';'))
+               <* (spaces <* char '}')
+
 data_definition :: Parsec String () Data
 data_definition = (string "data") *> spaces *> adt
   where adt :: Parsec String () Data
@@ -229,17 +250,23 @@ data_definition = (string "data") *> spaces *> adt
         rbrack = spaces <* (char '}')
 
 programFile :: Parsec String () Program
-programFile = categorize <$> (Program <$> (many (try include)) <*> pure [] <*> pure [] <*> pure [])
+programFile = categorize <$> (Program <$> (many (try include)) 
+                                      <*> pure []
+                                      <*> pure []
+                                      <*> pure []
+                                      <*> pure [])
                          <*> (many definitions)
   where categorize :: Program -> [Definition] -> Program
         categorize p [] = p
-        categorize (Program mods dat als trms) [x] =
-          case x of DataDef d -> Program mods (d:dat) als trms
-                    AliasDef a -> Program mods dat (a:als) trms
-                    TermDef t -> Program mods dat als (t:trms)
+        categorize (Program mods tcs dat als trms) [x] =
+          case x of DataDef d -> Program mods tcs (d:dat) als trms
+                    TypeClassDef c -> Program mods (c:tcs) dat als trms
+                    AliasDef a -> Program mods tcs dat (a:als) trms
+                    TermDef t -> Program mods tcs dat als (t:trms)
         categorize p (x:xs) = categorize (categorize p [x]) xs
         definitions :: Parsec String () Definition
         definitions = (DataDef <$> try (spaces *> data_definition <* spaces))
+                  <|> (TypeClassDef <$> try (spaces *> typeclass_definition))
                   <|> (AliasDef <$> try (spaces *> alias_definition <* spaces))
                   <|> (TermDef <$> (spaces *> term <* spaces))
 
@@ -248,10 +275,11 @@ parseProgram program =
   case parse programFile "(unknown)" program of
        Left e -> putStrLn "Parse Error"
               >> print e
-       Right (Program m d a t) -> mapM_ print m >> (putStrLn "\n")
-                               >> mapM_ print d >> (putStrLn "\n")
-                               >> mapM_ print a >> (putStrLn "\n")
-                               >> mapM_ print t
+       Right (Program m d c a t) -> mapM_ print m >> (putStrLn "\n")
+                                 >> mapM_ print d >> (putStrLn "\n")
+                                 >> mapM_ print c >> (putStrLn "\n")
+                                 >> mapM_ print a >> (putStrLn "\n")
+                                 >> mapM_ print t
 
 main :: IO ()
 main = getArgs >>= \args ->
