@@ -24,6 +24,7 @@ data Term = Term {
 data Expression = Closure Term
                 | Application Expression Expression
                 | BoundName Binding
+                | BoundOperator Binding
                 | Block Scope
                 | If Expression Expression Expression
                 | Else Expression
@@ -116,6 +117,9 @@ identifier :: Parsec String () String
 identifier = (:) <$> (oneOf iden_chars)
                  <*> (many $ oneOf $ iden_chars_rest)
 
+operator_identifier :: Parsec String () String
+operator_identifier = try $ many1 $ oneOf "!@#$%^&*-+<>?~:|"
+
 adt_name :: Parsec String () String
 adt_name = (:) <$> oneOf ['A'..'Z']
                <*> (many $ oneOf $ iden_chars_rest)
@@ -125,14 +129,17 @@ comment = (try $ string "//" *> (many anyChar) <* char '\n')
       <|> (try $ string "/*" *> (many anyChar) <* string "*/")
 
 literal :: Parsec String () Literal
-literal = (CharString <$> try (char '"' *> (many anyChar) <* char '"')) -- TODO escape characters
+literal = (CharString <$> try (char '"' *> many charac <* char '"'))
       <|> (CharSingle <$> try (char '\'' *> anyChar <* char '\''))
       <|> (Float <$> try floating)
       <|> (Integral <$> try int)
+  where charac :: Parsec String () Char
+        charac = (noneOf "\\\"\0\n\r\v\t\b\f") -- TODO excapes?
+
 
 term :: Parsec String () Term
 term = Term <$> data_type
-            <*> (identifier <* spaces)
+            <*> ((operator_identifier <|> identifier) <* spaces)
             <*> (space_series pattern)
             <*> (char '=' *> spaces *> term_set <* spaces)
   where term_set = block_expression <|> control_flow <|> application_expression
@@ -150,8 +157,9 @@ application :: Parsec String () [Expression]
 application = many1 (subexpr <* spaces)
   where subexpr :: Parsec String () Expression
         subexpr = (applChain <$> (char '(' *> spaces *> application <* spaces <* char ')'))
-              <|> (LiteralPattern <$> pattern)
               <|> (BoundName <$> identifier)
+              <|> (BoundOperator <$> operator_identifier)
+              <|> (LiteralPattern <$> pattern)
 
 applChain :: [Expression] -> Expression
 applChain a = (descend . reverse) a
