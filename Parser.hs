@@ -21,11 +21,8 @@ data Term = Term {
     evaluation :: Expression
 } deriving (Show)
 
-data TypeClass = TypeClass {
-    typeclassDependencies :: [Binding],
-    typeClassName :: Binding,
-    members :: [(Type, Binding)]
-} deriving (Show)
+data TypeClass = TypeClass [Binding] Binding [(Type, Binding)]
+               | Implementation Binding Binding [Term] deriving (Show)
 
 data Expression = Closure Term
                 | Application Expression Expression
@@ -227,6 +224,9 @@ typeclass_definition :: Parsec String () TypeClass
 typeclass_definition = TypeClass <$> (string "typeclass" *> spaces *> depends <* spaces)
                                  <*> adt_name
                                  <*> members
+                   <|> Implementation <$> (string "implement" *> spaces *> adt_name <* spaces)
+                                      <*> (adt_name <* spaces)
+                                      <*> impl
   where depends :: Parsec String () [Binding]
         depends = ((char '(' *> spaces)
                 *> (series (string "," ) adt_name)
@@ -237,6 +237,8 @@ typeclass_definition = TypeClass <$> (string "typeclass" *> spaces *> depends <*
                *> space_series ((,) <$> data_type
                                     <*> ((identifier <|> operator_identifier) <* spaces <* char ';'))
                <* (spaces <* char '}')
+        impl :: Parsec String () [Term]
+        impl = ((char '{' *> spaces) *> (many (term <* spaces)) <* char '}')
 
 data_definition :: Parsec String () Data
 data_definition = (string "data") *> spaces *> adt
