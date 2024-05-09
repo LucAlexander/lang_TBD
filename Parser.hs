@@ -14,11 +14,12 @@ data Program = Program [Module] [TypeClass] [Data] [Alias] [Term] deriving (Show
 type Scope = [Expression]
 type Binding = String
 
+data Lambda = Lambda [Pattern] Expression deriving (Show)
+
 data Term = Term {
     typeCons :: Type,
     termName :: Binding,
-    agumentNames :: [Pattern],
-    evaluation :: Expression
+    guardedExprs :: [Lambda]
 } deriving (Show)
 
 data TypeClass = TypeClass [CustomType] CustomType [(Type, Binding)]
@@ -51,7 +52,7 @@ data Type = TermType Type Type
           | F32 | F64
           | Chr
           | Bl
-          | UsrType CustomType Generics
+          | UsrType CustomType [Type]
           | TypeErr String deriving (Show)
 
 type CustomType = String
@@ -109,8 +110,7 @@ type_atom = Chr <$ (try $ string "char")
         <|> U16 <$ (try $ string "uint16")
         <|> U32 <$ (try $ string "uint32")
         <|> U64 <$ (try $ string "uint64")
-        <|> (UsrType <$> try (adt_name) <*> (spaces *> template_params))
-        <|> TypeErr <$> (many $ oneOf iden_chars_rest)
+        <|> (UsrType <$> try (adt_name) <*> (spaces *> (space_series type_atom)))
 
 iden_chars :: String
 iden_chars = ['a'..'z'] ++ "_"
@@ -144,8 +144,11 @@ literal = (CharString <$> try (char '"' *> many charac <* char '"'))
 term :: Parsec String () Term
 term = Term <$> data_type
             <*> ((operator_identifier <|> identifier) <* spaces)
-            <*> (space_series pattern)
-            <*> (char '=' *> spaces *> term_set <* spaces)
+            <*> series (string "|") lambda
+
+lambda :: Parsec String () Lambda
+lambda = Lambda <$> (space_series pattern)
+                <*> (char '=' *> spaces *> term_set <* spaces)
   where term_set = block_expression <|> control_flow <|> application_expression
 
 block_expression :: Parsec String () Expression
