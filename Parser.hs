@@ -126,7 +126,7 @@ identifier = (:) <$> (oneOf iden_chars)
                  <*> (many $ oneOf $ iden_chars_rest)
 
 operator_identifier :: Parsec String () String
-operator_identifier = try $ many1 $ oneOf "<>|!^*&#-+%$~?"
+operator_identifier = try $ many1 $ oneOf "<=>|!^*&#-+%$~?"
 
 adt_name :: Parsec String () String
 adt_name = (:) <$> oneOf ['A'..'Z']
@@ -183,7 +183,10 @@ applChain :: [Expression] -> Expression
 applChain a = (descend . reverse) a
   where descend :: [Expression] -> Expression
         descend [x] = x
-        descend (x:xs) = Application (descend xs) x
+        descend (x:xs) =
+          case x of 
+               BoundOperator _ -> Application x (descend xs)
+               _ -> Application (descend xs) x
 
 expression :: Parsec String () Expression
 expression = try control_flow
