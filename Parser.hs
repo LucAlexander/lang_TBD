@@ -29,6 +29,7 @@ type Generics = [CustomType]
 
 data Expression = Closure Term
                 | Application Expression Expression
+                | Anonymous Lambda
                 | BoundName Binding
                 | BoundOperator Binding
                 | Block Scope
@@ -164,6 +165,7 @@ application :: Parsec String () [Expression]
 application = many1 (subexpr <* spaces)
   where subexpr :: Parsec String () Expression
         subexpr = (applChain <$> (char '(' *> spaces *> application <* spaces <* char ')'))
+              <|> (Anonymous <$> (string "\\" *> lambda))
               <|> (BoundName <$> (try identifier))
               <|> (LiteralPattern <$> pattern)
               <|> (BoundOperator <$> operator_identifier)
