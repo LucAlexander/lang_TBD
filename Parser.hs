@@ -4,6 +4,8 @@ import System.IO
 import System.Environment
 import Control.Monad
 import Data.Char (isLetter, isDigit)
+import qualified Data.Text as T
+import Data.Text (Text, pack, unpack, splitOn)
 import Text.Parsec
 import Text.Parsec.Char
 import Text.ParserCombinators.Parsec.Number
@@ -317,9 +319,16 @@ programFile = categorize <$> (Program <$> (many (try include))
                   <|> (TermDef <$> (spaces *> term <* spaces))
                   <?> "valid definition"
 
+remove_comments :: String -> String -> String -> String
+remove_comments start end program =
+    let sections = divided program start end
+    in (unpack . T.concat) $ head sections ++ fmap (T.concat . tail) (tail sections)
+  where divided :: String -> String -> String-> [[Text]]
+        divided p s e = fmap (splitOn $ pack e) (splitOn (pack s) $ pack p) 
+
 parseProgram :: String -> IO ()
 parseProgram program =
-  case parse programFile "(unknown)" program of
+  case parse programFile "(unknown)" (remove_comments "/*" "*/" $ remove_comments "//" "\n" program) of
        Left e -> putStrLn "Parse Error"
               >> print e
        Right (Program m d c a t) -> mapM_ print m >> (putStrLn "\n")
