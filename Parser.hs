@@ -21,8 +21,10 @@ data Term = Term {
     evaluation :: Expression
 } deriving (Show)
 
-data TypeClass = TypeClass [Binding] Binding [(Type, Binding)]
-               | Implementation Binding Binding [Term] deriving (Show)
+data TypeClass = TypeClass [CustomType] CustomType [(Type, Binding)]
+               | Implementation CustomType CustomType Generics [Term] deriving (Show)
+
+type Generics = [CustomType]
 
 data Expression = Closure Term
                 | Application Expression Expression
@@ -49,13 +51,13 @@ data Type = TermType Type Type
           | F32 | F64
           | Chr
           | Bl
-          | UsrType CustomType
+          | UsrType CustomType Generics
           | TypeErr String deriving (Show)
 
 type CustomType = String
 
-data Data = Product String [Data]
-          | Sum String [Data]
+data Data = Product CustomType Generics [Data]
+          | Sum CustomType Generics [Data]
           | Record Type Binding deriving (Show)
 
 data Alias = Alias String Type deriving (Show)
@@ -89,7 +91,6 @@ data_type = descend <$> (series (string "->") expansion)
         descend [] = TypeErr "invalid type"
         descend [x] = x
         descend (x:xs) = TermType x $ descend xs
-
         expansion :: Parsec String () Type
         expansion = (char '(' *> data_type <* char ')')
                 <|> type_atom
@@ -108,8 +109,8 @@ type_atom = Chr <$ (try $ string "char")
         <|> U16 <$ (try $ string "uint16")
         <|> U32 <$ (try $ string "uint32")
         <|> U64 <$ (try $ string "uint64")
-        <|> UsrType <$> (try adt_name)
-        <|> TypeErr <$> (many $ oneOf $ iden_chars_rest)
+        <|> (UsrType <$> try (adt_name) <*> (spaces *> template_params))
+        <|> TypeErr <$> (many $ oneOf iden_chars_rest)
 
 iden_chars :: String
 iden_chars = ['a'..'z'] ++ "_"
@@ -226,13 +227,14 @@ typeclass_definition = TypeClass <$> (string "typeclass" *> spaces *> depends <*
                                  <*> members
                    <|> Implementation <$> (string "implement" *> spaces *> adt_name <* spaces)
                                       <*> (adt_name <* spaces)
+                                      <*> template_params
                                       <*> impl
-  where depends :: Parsec String () [Binding]
+  where depends :: Parsec String () [CustomType]
         depends = ((char '(' *> spaces)
                 *> (series (string "," ) adt_name)
                 <* (spaces *> char ')' *> spaces *> string "=>"))
               <|> (pure [])
-        members :: Parsec String () [(Type, Binding)]
+        members :: Parsec String () [(Type, CustomType)]
         members = (spaces *> char '{' *> spaces)
                *> space_series ((,) <$> data_type
                                     <*> ((identifier <|> operator_identifier) <* spaces <* char ';'))
@@ -243,13 +245,21 @@ typeclass_definition = TypeClass <$> (string "typeclass" *> spaces *> depends <*
 data_definition :: Parsec String () Data
 data_definition = (string "data") *> spaces *> adt
   where adt :: Parsec String () Data
-        adt = try (Product <$> typename <*> (lbrack *> (series (string "|") adt) <* rbrack))
-          <|> Sum <$> typename <*> ((lbrack *> many ((record <* spaces)) <* rbrack) <|> (pure []))
+        adt = try (Product <$> typename
+                           <*> template_params
+                           <*> (lbrack *> (series (string "|") adt) <* rbrack))
+          <|> Sum <$> typename
+                  <*> template_params
+                  <*> ((lbrack *> many ((record <* spaces)) <* rbrack) <|> (pure []))
         record :: Parsec String () Data
         record = Record <$> (data_type <* spaces) <*> (identifier <* spaces <* char ';')
+        typename :: Parsec String () CustomType
         typename = adt_name <* spaces
         lbrack = (char '{') *> spaces
         rbrack = spaces <* (char '}')
+
+template_params :: Parsec String () Generics
+template_params = many (adt_name <* spaces) <* spaces
 
 programFile :: Parsec String () Program
 programFile = categorize <$> (Program <$> (many (try include)) 
@@ -261,8 +271,8 @@ programFile = categorize <$> (Program <$> (many (try include))
   where categorize :: Program -> [Definition] -> Program
         categorize p [] = p
         categorize (Program mods tcs dat als trms) [x] =
-          case x of DataDef d -> Program mods tcs (d:dat) als trms
-                    TypeClassDef c -> Program mods (c:tcs) dat als trms
+          case x of TypeClassDef c -> Program mods (c:tcs) dat als trms
+                    DataDef d -> Program mods tcs (d:dat) als trms
                     AliasDef a -> Program mods tcs dat (a:als) trms
                     TermDef t -> Program mods tcs dat als (t:trms)
         categorize p (x:xs) = categorize (categorize p [x]) xs
