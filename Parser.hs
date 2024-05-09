@@ -152,7 +152,7 @@ lambda = Lambda <$> (space_series pattern)
   where term_set = block_expression <|> control_flow <|> application_expression
 
 block_expression :: Parsec String () Expression
-block_expression = (Block <$> (char '{' *> spaces *> (many expression) <* spaces <* char '}'))
+block_expression = (Block <$> (char '{' *> spaces *> (many expression <* spaces) <* spaces <* char '}'))
 
 application_expression :: Parsec String () Expression
 application_expression = applChain <$> (application <* (char ';' <* spaces))
@@ -164,9 +164,10 @@ application :: Parsec String () [Expression]
 application = many1 (subexpr <* spaces)
   where subexpr :: Parsec String () Expression
         subexpr = (applChain <$> (char '(' *> spaces *> application <* spaces <* char ')'))
-              <|> (BoundName <$> identifier)
+              <|> (BoundName <$> (try identifier))
               <|> (LiteralPattern <$> pattern)
               <|> (BoundOperator <$> operator_identifier)
+              <?> "bound name for application"
 
 applChain :: [Expression] -> Expression
 applChain a = (descend . reverse) a
@@ -175,10 +176,11 @@ applChain a = (descend . reverse) a
         descend (x:xs) = Application (descend xs) x
 
 expression :: Parsec String () Expression
-expression = control_flow
+expression = try control_flow
          <|> block_expression
-         <|> (Closure <$> try term)
-         <|> application_expression
+         <|> try application_expression
+         <|> (Closure <$> (try term))
+         <?> "valid expression"
 
 control_flow :: Parsec String () Expression
 control_flow = If <$> try (string "if" *> spaces *> predicate <* spaces)
@@ -186,8 +188,9 @@ control_flow = If <$> try (string "if" *> spaces *> predicate <* spaces)
                   <*> ((Else <$> (try (spaces *> string "else" *> spaces *> elsexpr <* spaces))) <|> (pure Nop))
            <|> Case <$> (try (string "case" *> spaces *> predicate <* spaces))
                     <*> (spaces *> match_block <* spaces)
+           <?> "valid control flow structure"
   where elsexpr :: Parsec String () Expression
-        elsexpr = control_flow <|> block_expression <|> application_expression
+        elsexpr = control_flow <|> block_expression <|> application_expression <?> "valid expression for else: control flow, block, application"
 
 match_block :: Parsec String () [Match]
 match_block = (char '{' *> spaces) *> (many1 match) <* (spaces <* char '}')
@@ -198,6 +201,7 @@ match = Match <$> (pattern <* spaces) <*> (string "->" *> spaces *> match_set <*
         match_set = control_flow
                 <|> block_expression
                 <|> application_expression
+                <?> "valid expression for match: control flow, block, application"
 
 pattern :: Parsec String () Pattern
 pattern = (ReferenceShape <$> (try (identifier <* (spaces *> char '@' <* spaces)))
@@ -205,6 +209,7 @@ pattern = (ReferenceShape <$> (try (identifier <* (spaces *> char '@' <* spaces)
       <|> (Shape <$> (unbounded <|> grouping))
       <|> LitAnchor <$> literal
       <|> Anchor <$> identifier
+      <?> "valid pattern"
   where grouping :: Parsec String () [Pattern]
         grouping = (char '(' *> spaces) *> (((:) <$> pattern <*> pure []) <|> unbounded) <* (spaces <* char ')')
         unbounded :: Parsec String () [Pattern]
@@ -232,6 +237,7 @@ typeclass_definition = TypeClass <$> (string "typeclass" *> spaces *> depends <*
                                       <*> (adt_name <* spaces)
                                       <*> template_params
                                       <*> impl
+                   <?> "valid typeclass declaration or implementation"
   where depends :: Parsec String () [CustomType]
         depends = ((char '(' *> spaces)
                 *> (series (string "," ) adt_name)
@@ -254,6 +260,7 @@ data_definition = (string "data") *> spaces *> adt
           <|> Sum <$> typename
                   <*> template_params
                   <*> ((lbrack *> many ((record <* spaces)) <* rbrack) <|> (pure []))
+          <?> "valid data structure"
         record :: Parsec String () Data
         record = Record <$> (data_type <* spaces) <*> (identifier <* spaces <* char ';')
         typename :: Parsec String () CustomType
@@ -284,6 +291,7 @@ programFile = categorize <$> (Program <$> (many (try include))
                   <|> (TypeClassDef <$> try (spaces *> typeclass_definition))
                   <|> (AliasDef <$> try (spaces *> alias_definition <* spaces))
                   <|> (TermDef <$> (spaces *> term <* spaces))
+                  <?> "valid definition"
 
 parseProgram :: String -> IO ()
 parseProgram program =
