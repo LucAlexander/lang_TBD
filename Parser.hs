@@ -152,20 +152,26 @@ lambda = Lambda <$> (space_series pattern)
                 <*> (char '=' *> spaces *> term_set <* spaces)
   where term_set = block_expression <|> control_flow <|> application_expression
 
+anonymous_lambda :: Parsec String () Expression
+anonymous_lambda = Anonymous <$> (Lambda <$> (space_series pattern)
+                                         <*> (char '=' *> spaces *> anon_set <* spaces))
+  where anon_set = block_expression <|> applicable_control_flow <|> application
+
 block_expression :: Parsec String () Expression
 block_expression = (Block <$> (char '{' *> spaces *> (many expression <* spaces) <* spaces <* char '}'))
 
 application_expression :: Parsec String () Expression
-application_expression = applChain <$> (application <* (char ';' <* spaces))
+application_expression = applChain <$> (application_seq <* (char ';' <* spaces))
 
-predicate :: Parsec String () Expression
-predicate = applChain <$> application
+application :: Parsec String () Expression
+application = applChain <$> application_seq
 
-application :: Parsec String () [Expression]
-application = many1 (subexpr <* spaces)
+application_seq :: Parsec String () [Expression]
+application_seq = many1 (subexpr <* spaces)
   where subexpr :: Parsec String () Expression
-        subexpr = (applChain <$> (char '(' *> spaces *> application <* spaces <* char ')'))
-              <|> (Anonymous <$> (string "\\" *> lambda))
+        subexpr = (applChain <$> (char '(' *> spaces *> application_seq <* spaces <* char ')'))
+              <|> try anonymous_lambda
+              <|> applicable_control_flow
               <|> (BoundName <$> (try identifier))
               <|> (LiteralPattern <$> pattern)
               <|> (BoundOperator <$> operator_identifier)
@@ -184,15 +190,31 @@ expression = try control_flow
          <|> (Closure <$> (try term))
          <?> "valid expression"
 
-control_flow :: Parsec String () Expression
-control_flow = If <$> try (string "if" *> spaces *> predicate <* spaces)
+applicable_control_flow :: Parsec String () Expression
+applicable_control_flow = If <$> try (string "if" *> spaces *> application <* spaces)
                   <*> (spaces *> block_expression <* spaces)
                   <*> ((Else <$> (try (spaces *> string "else" *> spaces *> elsexpr <* spaces))) <|> (pure Nop))
-           <|> Case <$> (try (string "case" *> spaces *> predicate <* spaces))
+           <|> Case <$> (try (string "case" *> spaces *> application <* spaces))
                     <*> (spaces *> match_block <* spaces)
            <?> "valid control flow structure"
   where elsexpr :: Parsec String () Expression
-        elsexpr = control_flow <|> block_expression <|> application_expression <?> "valid expression for else: control flow, block, application"
+        elsexpr = try applicable_control_flow
+              <|> block_expression
+              <|> application 
+              <?> "valid expression for else: control flow, block, application"
+
+control_flow :: Parsec String () Expression
+control_flow = If <$> try (string "if" *> spaces *> application <* spaces)
+                  <*> (spaces *> block_expression <* spaces)
+                  <*> ((Else <$> (try (spaces *> string "else" *> spaces *> elsexpr <* spaces))) <|> (pure Nop))
+           <|> Case <$> (try (string "case" *> spaces *> application <* spaces))
+                    <*> (spaces *> match_block <* spaces)
+           <?> "valid control flow structure"
+  where elsexpr :: Parsec String () Expression
+        elsexpr = try control_flow
+              <|> block_expression
+              <|> application_expression
+              <?> "valid expression for else: control flow, block, application"
 
 match_block :: Parsec String () [Match]
 match_block = (char '{' *> spaces) *> (many1 match) <* (spaces <* char '}')
