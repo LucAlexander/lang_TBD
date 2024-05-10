@@ -337,13 +337,6 @@ programFile = categorize <$> (Program <$> (many (try include))
                   <|> (TermDef <$> (spaces *> term <* spaces))
                   <?> "valid definition"
 
-remove_comments :: String -> String -> String -> String
-remove_comments start end program =
-    let sections = divided program start end
-    in (unpack . T.concat) $ head sections ++ fmap (T.concat . tail) (tail sections)
-  where divided :: String -> String -> String-> [[Text]]
-        divided p s e = fmap (splitOn $ pack e) (splitOn (pack s) $ pack p) 
-
 remove_line_comments :: String -> String
 remove_line_comments program = (unpack . (T.intercalate $ pack "\n"))
                              $ fmap head
@@ -352,7 +345,14 @@ remove_line_comments program = (unpack . (T.intercalate $ pack "\n"))
                              $ pack program
 
 remove_block_comments :: String -> String
-remove_block_comments program = program
+remove_block_comments program = (unpack . T.concat)
+                              $ fmap T.concat
+                              $ fill_lines
+                              $ fmap (splitOn $ pack "*/")
+                              $ splitOn (pack "/*")
+                              $ pack program
+  where fill_lines :: [[Text]] -> [[Text]]
+        fill_lines x = head x : (fmap (\xs -> pack (take ((length $ splitOn (pack "\n") $ head xs) - 1) $ repeat '\n') : (tail xs)) $ tail x)
 
 parseProgram :: String -> IO ()
 parseProgram program =
