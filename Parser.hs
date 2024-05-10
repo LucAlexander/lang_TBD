@@ -104,19 +104,26 @@ data_type = descend <$> (series (string "->") expansion)
                 <?> "valid term type or atom type"
 
 type_atom :: Parsec String () Type
-type_atom = Chr <$ (try $ string "char")
-        <|> Bl <$ (try $ string "bool")
-        <|> F64 <$ (try $ string "double")
-        <|> F32 <$ (try $ string "float")
-        <|> I8 <$ (try $ string "int8")
-        <|> I16 <$ (try $ string "int16")
-        <|> I32 <$ (try $ string "int32")
-        <|> I64 <$ (try $ string "int64")
-        <|> U8 <$ (try $ string "uint8")
-        <|> U16 <$ (try $ string "uint16")
-        <|> U32 <$ (try $ string "uint32")
-        <|> U64 <$ (try $ string "uint64")
-        <|> (UsrType <$> try (adt_name) <*> (spaces *> (space_series type_atom)))
+type_atom = primitive <|> custom
+  where primitive :: Parsec String () Type
+        primitive = Chr <$ (try $ string "char")
+                <|> Bl <$ (try $ string "bool")
+                <|> F64 <$ (try $ string "double")
+                <|> F32 <$ (try $ string "float")
+                <|> I8 <$ (try $ string "int8")
+                <|> I16 <$ (try $ string "int16")
+                <|> I32 <$ (try $ string "int32")
+                <|> I64 <$ (try $ string "int64")
+                <|> U8 <$ (try $ string "uint8")
+                <|> U16 <$ (try $ string "uint16")
+                <|> U32 <$ (try $ string "uint32")
+                <|> U64 <$ (try $ string "uint64")
+        custom :: Parsec String () Type
+        custom = (UsrType <$> try (adt_name) <*> (spaces *> space_series generic))
+        generic :: Parsec String () Type
+        generic = primitive
+              <|> (UsrType <$> try (adt_name) <*> pure [])
+              <|> (char '(' *> spaces *> type_atom <* spaces <* char ')')
 
 iden_chars :: String
 iden_chars = ['a'..'z'] ++ "_"
