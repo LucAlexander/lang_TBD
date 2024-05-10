@@ -11,6 +11,7 @@ import Text.Parsec.Char
 import Text.ParserCombinators.Parsec.Number
 import Data.Functor.Foldable
 import Numeric
+import Text.Pretty.Simple
 
 data Program = Program [Module] [TypeClass] [Data] [Alias] [Term] deriving (Show)
 type Scope = [Expression]
@@ -34,6 +35,8 @@ data Expression = Closure Term
                 | Anonymous Lambda
                 | BoundName Binding
                 | BoundOperator Binding
+                | StructAccess Binding
+                | Return Expression
                 | Block Scope
                 | If Expression Expression Expression
                 | Else Expression
@@ -126,7 +129,11 @@ identifier = (:) <$> (oneOf iden_chars)
                  <*> (many $ oneOf $ iden_chars_rest)
 
 operator_identifier :: Parsec String () String
-operator_identifier = try $ many1 $ oneOf "<=>|!^*&#-+%$~?"
+operator_identifier =
+    let allowed = "<.=>|!^*&#-+@%$~?"
+        reserved = ".|?+-*/@"
+     in try ((:) <$> (oneOf allowed) <*> (many1 $ oneOf allowed))
+    <|> try ((:) <$> (oneOf reserved <* notFollowedBy (oneOf reserved)) <*> pure [])
 
 adt_name :: Parsec String () String
 adt_name = (:) <$> oneOf ['A'..'Z']
@@ -155,7 +162,7 @@ lambda = Lambda <$> (space_series pattern)
   where term_set = block_expression <|> control_flow <|> application_expression
 
 anonymous_lambda :: Parsec String () Expression
-anonymous_lambda = Anonymous <$> (Lambda <$> (space_series pattern)
+anonymous_lambda = Anonymous <$> (Lambda <$> (char '\\' *> space_series pattern)
                                          <*> (char '=' *> spaces *> anon_set <* spaces))
   where anon_set = block_expression <|> applicable_control_flow <|> application
 
@@ -172,6 +179,8 @@ application_seq :: Parsec String () [Expression]
 application_seq = many1 (subexpr <* spaces)
   where subexpr :: Parsec String () Expression
         subexpr = (applChain <$> (char '(' *> spaces *> application_seq <* spaces <* char ')'))
+              <|> try return_expression
+              <|> try structure_access
               <|> try anonymous_lambda
               <|> applicable_control_flow
               <|> (BoundName <$> (try identifier))
@@ -187,6 +196,12 @@ applChain a = (descend . reverse) a
           case x of 
                BoundOperator _ -> Application x (descend xs)
                _ -> Application (descend xs) x
+
+structure_access :: Parsec String () Expression
+structure_access = StructAccess <$> (char '@'*> identifier)
+
+return_expression :: Parsec String () Expression
+return_expression = Return <$> (string "return" *> spaces *> application)
 
 expression :: Parsec String () Expression
 expression = try control_flow
@@ -329,16 +344,26 @@ remove_comments start end program =
   where divided :: String -> String -> String-> [[Text]]
         divided p s e = fmap (splitOn $ pack e) (splitOn (pack s) $ pack p) 
 
+remove_line_comments :: String -> String
+remove_line_comments program = (unpack . (T.intercalate $ pack "\n"))
+                             $ fmap head
+                             $ fmap (splitOn $ pack "//")
+                             $ splitOn (pack "\n")
+                             $ pack program
+
+remove_block_comments :: String -> String
+remove_block_comments program = program
+
 parseProgram :: String -> IO ()
 parseProgram program =
-  case parse programFile "(unknown)" (remove_comments "/*" "*/" $ remove_comments "//" "\n" program) of
+  case parse programFile "(unknown)" (remove_line_comments $ remove_block_comments program) of
        Left e -> putStrLn "Parse Error"
               >> print e
-       Right (Program m d c a t) -> mapM_ print m >> (putStrLn "\n")
-                                 >> mapM_ print d >> (putStrLn "\n")
-                                 >> mapM_ print c >> (putStrLn "\n")
-                                 >> mapM_ print a >> (putStrLn "\n")
-                                 >> mapM_ print t
+       Right (Program m d c a t) -> mapM_ pPrint m >> (putStrLn "\n")
+                                 >> mapM_ pPrint d >> (putStrLn "\n")
+                                 >> mapM_ pPrint c >> (putStrLn "\n")
+                                 >> mapM_ pPrint a >> (putStrLn "\n")
+                                 >> mapM_ pPrint t
 
 main :: IO ()
 main = getArgs >>= \args ->
