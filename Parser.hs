@@ -131,7 +131,7 @@ identifier = (:) <$> (oneOf iden_chars)
 operator_identifier :: Parsec String () String
 operator_identifier =
     let allowed = "<.=>|!^*&#-+@%$~?"
-        reserved = ".|?+-*/@"
+        reserved = ".|?+-*/@$"
      in try ((:) <$> (oneOf allowed) <*> (many1 $ oneOf allowed))
     <|> try ((:) <$> (oneOf reserved <* notFollowedBy (oneOf reserved)) <*> pure [])
 
@@ -189,13 +189,19 @@ application_seq = many1 (subexpr <* spaces)
               <?> "bound name for application"
 
 applChain :: [Expression] -> Expression
-applChain a = (descend . reverse) a
+applChain a = (descend . reverse) $ abstract a
   where descend :: [Expression] -> Expression
         descend [x] = x
         descend (x:xs) =
           case x of 
                BoundOperator _ -> Application x (descend xs)
                _ -> Application (descend xs) x
+        abstract :: [Expression] -> [Expression]
+        abstract [x] = [x]
+        abstract (x:xs) = 
+          case x of
+               BoundOperator "$" -> [applChain xs]
+               _ -> x:(abstract xs)
 
 structure_access :: Parsec String () Expression
 structure_access = StructAccess <$> (char '@'*> identifier)
