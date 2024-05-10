@@ -58,6 +58,7 @@ data Type = TermType Type Type
           | F32 | F64
           | Chr
           | Bl
+          | Array Type
           | UsrType CustomType [Type]
           | TypeErr String deriving (Show)
 
@@ -77,6 +78,7 @@ data Definition = TermDef Term
 data Literal = Integral Int
              | Float Double
              | CharString String
+             | ArrayLiteral [Expression]
              | CharSingle Char deriving (Show)
 
 data Module = Include Filename deriving (Show)
@@ -104,7 +106,7 @@ data_type = descend <$> (series (string "->") expansion)
                 <?> "valid term type or atom type"
 
 type_atom :: Parsec String () Type
-type_atom = primitive <|> custom
+type_atom = primitive <|> array <|> custom
   where primitive :: Parsec String () Type
         primitive = Chr <$ (try $ string "char")
                 <|> Bl <$ (try $ string "bool")
@@ -118,12 +120,15 @@ type_atom = primitive <|> custom
                 <|> U16 <$ (try $ string "uint16")
                 <|> U32 <$ (try $ string "uint32")
                 <|> U64 <$ (try $ string "uint64")
+        array :: Parsec String () Type
+        array = try (Array <$> ((char '[' *> spaces) *> data_type <* (spaces <* char ']')))
         custom :: Parsec String () Type
         custom = (UsrType <$> try (adt_name) <*> (spaces *> space_series generic))
         generic :: Parsec String () Type
         generic = primitive
+              <|> array
               <|> (UsrType <$> try (adt_name) <*> pure [])
-              <|> (char '(' *> spaces *> type_atom <* spaces <* char ')')
+              <|> ((char '(' *> spaces) *> type_atom <* (spaces <* char ')'))
 
 iden_chars :: String
 iden_chars = ['a'..'z'] ++ "_"
@@ -155,8 +160,14 @@ literal = (CharString <$> try (char '"' *> many charac <* char '"'))
       <|> (CharSingle <$> try (char '\'' *> anyChar <* char '\''))
       <|> (Float <$> try (ap sign floating))
       <|> (Integral <$> try int)
+      <|> (ArrayLiteral <$> (char '[' *> spaces *> (series (string ",") array_comps) <* char ']'))
+      <?> "valid literal"
   where charac :: Parsec String () Char
         charac = (noneOf "\\\"\0\n\r\v\t\b\f") -- TODO excapes?
+        array_comps :: Parsec String () Expression
+        array_comps = try applicable_control_flow
+                  <|> block_expression
+                  <|> application 
 
 term :: Parsec String () Term
 term = Term <$> data_type
