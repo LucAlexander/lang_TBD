@@ -51,6 +51,7 @@ data Match = Match Pattern Expression deriving (Show)
 
 data Pattern = Shape [Pattern]
              | ReferenceShape Binding Pattern
+             | ExternTypeAnchor [CustomType] CustomType
              | TypeAnchor CustomType
              | LitAnchor Literal
              | ArrayPattern [Pattern]
@@ -304,7 +305,8 @@ pattern = (ReferenceShape <$> (try (identifier <* (spaces *> char '@' <* spaces)
         unbounded = (:) <$> typeMatch
                         <*> (many (pattern <* spaces))
         typeMatch :: Parsec String () Pattern
-        typeMatch = TypeAnchor <$> (adt_name <* spaces)
+        typeMatch = (ExternTypeAnchor <$> many1 (try (adt_name <* string "::")) <*> (adt_name <* spaces))
+                <|> TypeAnchor <$> (adt_name <* spaces)
         array_pattern :: Parsec String () Pattern
         array_pattern = ArrayPattern <$> (try $ (char '[' *> spaces) *> (series (string ":") pattern) <* (spaces <* char ']'))
 
