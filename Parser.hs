@@ -13,9 +13,11 @@ import Data.Functor.Foldable
 import Numeric
 import Text.Pretty.Simple
 
-data Program = Program [Module] [TypeClass] [Data] [Alias] [Term] deriving (Show)
+data Program = Program [Module] Namespace deriving (Show)
 type Scope = [Expression]
 type Binding = String
+
+data Namespace = Namespace String [Namespace] [TypeClass] [Data] [Alias] [Term] deriving (Show)
 
 data Lambda = Lambda [Pattern] Expression deriving (Show)
 
@@ -74,6 +76,7 @@ data Alias = Alias String Type deriving (Show)
 data Definition = TermDef Term
                 | AliasDef Alias
                 | TypeClassDef TypeClass
+                | NamespaceDef Namespace
                 | DataDef Data deriving (Show)
 
 data Literal = Integral Int
@@ -343,27 +346,47 @@ data_definition = (string "data") *> spaces *> adt
 template_params :: Parsec String () Generics
 template_params = many (adt_name <* spaces) <* spaces
 
+empty_namespace :: Parsec String () String -> Parsec String () Namespace
+empty_namespace name = Namespace <$> name
+                                 <*> pure []
+                                 <*> pure []
+                                 <*> pure []
+                                 <*> pure []
+                                 <*> pure []
+
+custom_namespace_definitions :: Parsec String () Namespace
+custom_namespace_definitions =
+    string "namespace" *> spaces *>
+    (categorize_namespace <$> (empty_namespace $ try identifier)
+                          <*> definition_block)
+  where definition_block :: Parsec String () [Definition]
+        definition_block = (spaces *> char '{' *> spaces *> (many global_definitions) <* spaces <* char '}')
+
+parse_namespace :: Parsec String () Namespace
+parse_namespace = categorize_namespace <$> (empty_namespace $ pure "global")
+                                       <*> (many global_definitions)
+
+categorize_namespace :: Namespace -> [Definition] -> Namespace
+categorize_namespace p [] = p
+categorize_namespace (Namespace name nms tcs dat als trms) [x] =
+  case x of NamespaceDef n -> Namespace name (n:nms) tcs dat als trms
+            TypeClassDef c -> Namespace name nms (c:tcs) dat als trms
+            DataDef d -> Namespace name nms tcs (d:dat) als trms
+            AliasDef a -> Namespace name nms tcs dat (a:als) trms
+            TermDef t -> Namespace name nms tcs dat als (t:trms)
+categorize_namespace p (x:xs) = categorize_namespace (categorize_namespace p [x]) xs
+
+global_definitions :: Parsec String () Definition
+global_definitions = (DataDef <$> try (spaces *> data_definition <* spaces))
+                 <|> (NamespaceDef <$> try (spaces *> custom_namespace_definitions))
+                 <|> (TypeClassDef <$> try (spaces *> typeclass_definition))
+                 <|> (AliasDef <$> try (spaces *> alias_definition <* spaces))
+                 <|> (TermDef <$> (spaces *> term <* spaces))
+                 <?> "valid definition"
+
 programFile :: Parsec String () Program
-programFile = categorize <$> (Program <$> (many (try include)) 
-                                      <*> pure []
-                                      <*> pure []
-                                      <*> pure []
-                                      <*> pure [])
-                         <*> (many definitions)
-  where categorize :: Program -> [Definition] -> Program
-        categorize p [] = p
-        categorize (Program mods tcs dat als trms) [x] =
-          case x of TypeClassDef c -> Program mods (c:tcs) dat als trms
-                    DataDef d -> Program mods tcs (d:dat) als trms
-                    AliasDef a -> Program mods tcs dat (a:als) trms
-                    TermDef t -> Program mods tcs dat als (t:trms)
-        categorize p (x:xs) = categorize (categorize p [x]) xs
-        definitions :: Parsec String () Definition
-        definitions = (DataDef <$> try (spaces *> data_definition <* spaces))
-                  <|> (TypeClassDef <$> try (spaces *> typeclass_definition))
-                  <|> (AliasDef <$> try (spaces *> alias_definition <* spaces))
-                  <|> (TermDef <$> (spaces *> term <* spaces))
-                  <?> "valid definition"
+programFile = (Program <$> (many $ try include)
+                       <*> parse_namespace)
 
 remove_line_comments :: String -> String
 remove_line_comments program = (unpack . (T.intercalate $ pack "\n"))
@@ -387,11 +410,12 @@ parseProgram program =
   case parse programFile "(unknown)" (remove_line_comments $ remove_block_comments program) of
        Left e -> putStrLn "Parse Error"
               >> print e
-       Right (Program m d c a t) -> mapM_ pPrint m >> (putStrLn "\n")
-                                 >> mapM_ pPrint d >> (putStrLn "\n")
-                                 >> mapM_ pPrint c >> (putStrLn "\n")
-                                 >> mapM_ pPrint a >> (putStrLn "\n")
-                                 >> mapM_ pPrint t
+       Right (Program m (Namespace _ n c d a t)) -> mapM_ pPrint m >> (putStrLn "\n")
+                                                 >> mapM_ pPrint n >> (putStrLn "\n")
+                                                 >> mapM_ pPrint c >> (putStrLn "\n")
+                                                 >> mapM_ pPrint d >> (putStrLn "\n")
+                                                 >> mapM_ pPrint a >> (putStrLn "\n")
+                                                 >> mapM_ pPrint t >> (putStrLn "\n")
 
 main :: IO ()
 main = getArgs >>= \args ->
