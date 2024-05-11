@@ -47,9 +47,10 @@ data Expression = Closure Term
 data Match = Match Pattern Expression deriving (Show)
 
 data Pattern = Shape [Pattern]
-             | ReferenceShape Binding [Pattern]
+             | ReferenceShape Binding Pattern
              | TypeAnchor CustomType
              | LitAnchor Literal
+             | ArrayPattern [Pattern]
              | Anchor Binding deriving (Show)
 
 data Type = TermType Type Type
@@ -273,8 +274,9 @@ match = Match <$> (pattern <* spaces) <*> (string "->" *> spaces *> match_set <*
 
 pattern :: Parsec String () Pattern
 pattern = (ReferenceShape <$> (try (identifier <* (spaces *> char '@' <* spaces)))
-                          <*> grouping)
+                          <*> ((Shape <$> grouping) <|> array_pattern))
       <|> (Shape <$> (unbounded <|> grouping))
+      <|> array_pattern
       <|> LitAnchor <$> literal
       <|> Anchor <$> identifier
       <?> "valid pattern"
@@ -285,6 +287,8 @@ pattern = (ReferenceShape <$> (try (identifier <* (spaces *> char '@' <* spaces)
                         <*> (many (pattern <* spaces))
         typeMatch :: Parsec String () Pattern
         typeMatch = TypeAnchor <$> (adt_name <* spaces)
+        array_pattern :: Parsec String () Pattern
+        array_pattern = ArrayPattern <$> (try $ (char '[' *> spaces) *> (series (string ":") pattern) <* (spaces <* char ']'))
 
 include :: Parsec String () Module
 include = Include <$> (string "include" *> spaces *> filename <* spaces <* char ';' <* spaces)
