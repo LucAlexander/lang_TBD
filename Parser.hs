@@ -38,6 +38,7 @@ data Expression = Closure Term
                 | BoundName Binding
                 | BoundOperator Binding
                 | StructAccess Binding
+                | NamespaceAccess [CustomType] Binding
                 | Return Expression
                 | Block Scope
                 | If Expression Expression Expression
@@ -63,6 +64,7 @@ data Type = TermType Type Type
           | Bl
           | Array Type
           | UsrType CustomType [Type]
+          | ExternType [CustomType] Type
           | TypeErr String deriving (Show)
 
 type CustomType = String
@@ -110,8 +112,14 @@ data_type = descend <$> (series (string "->") expansion)
                 <?> "valid term type or atom type"
 
 type_atom :: Parsec String () Type
-type_atom = primitive <|> array <|> custom
-  where primitive :: Parsec String () Type
+type_atom = primitive
+        <|> array
+        <|> extern
+        <|> custom
+        <?> "valid type atom"
+  where extern :: Parsec String () Type
+        extern = try (ExternType <$> many1 (try (adt_name <* string "::")) <*> custom)
+        primitive :: Parsec String () Type
         primitive = Chr <$ (try $ string "char")
                 <|> Bl <$ (try $ string "bool")
                 <|> F64 <$ (try $ string "double")
@@ -124,6 +132,7 @@ type_atom = primitive <|> array <|> custom
                 <|> U16 <$ (try $ string "uint16")
                 <|> U32 <$ (try $ string "uint32")
                 <|> U64 <$ (try $ string "uint64")
+                <?> "valid primitive"
         array :: Parsec String () Type
         array = try (Array <$> ((char '[' *> spaces) *> data_type <* (spaces <* char ']')))
         custom :: Parsec String () Type
@@ -133,6 +142,7 @@ type_atom = primitive <|> array <|> custom
               <|> array
               <|> (UsrType <$> try (adt_name) <*> pure [])
               <|> ((char '(' *> spaces) *> type_atom <* (spaces <* char ')'))
+              <?> "generic"
 
 iden_chars :: String
 iden_chars = ['a'..'z'] ++ "_"
@@ -202,6 +212,7 @@ application_seq = many1 (subexpr <* spaces)
   where subexpr :: Parsec String () Expression
         subexpr = (applChain <$> (char '(' *> spaces *> application_seq <* spaces <* char ')'))
               <|> try return_expression
+              <|> try namespace_access
               <|> try structure_access
               <|> try anonymous_lambda
               <|> applicable_control_flow
@@ -227,6 +238,10 @@ applChain a = (descend . reverse) $ abstract a
 
 structure_access :: Parsec String () Expression
 structure_access = StructAccess <$> (char '@'*> identifier)
+
+namespace_access :: Parsec String () Expression
+namespace_access = NamespaceAccess <$> many1 (adt_name <* string "::")
+                                   <*> (try identifier <|> try adt_name <|> operator_identifier)
 
 return_expression :: Parsec String () Expression
 return_expression = Return <$> (string "return" *> spaces *> application)
@@ -357,7 +372,7 @@ empty_namespace name = Namespace <$> name
 custom_namespace_definitions :: Parsec String () Namespace
 custom_namespace_definitions =
     string "namespace" *> spaces *>
-    (categorize_namespace <$> (empty_namespace $ try identifier)
+    (categorize_namespace <$> (empty_namespace $ try adt_name)
                           <*> definition_block)
   where definition_block :: Parsec String () [Definition]
         definition_block = (spaces *> char '{' *> spaces *> (many global_definitions) <* spaces <* char '}')
