@@ -25,7 +25,7 @@ data Term = Term {
     typeCons :: Type,
     termName :: Binding,
     guardedExprs :: [Lambda]
-} deriving (Show)
+} |  DependentTerm [(CustomType, CustomType)] Term deriving (Show)
 
 data TypeClass = TypeClass [CustomType] CustomType [(Type, Binding)]
                | Implementation CustomType CustomType Generics [Term] deriving (Show)
@@ -185,9 +185,16 @@ literal = (CharString <$> try (char '"' *> many charac <* char '"'))
                   <|> application 
 
 term :: Parsec String () Term
-term = Term <$> data_type
-            <*> ((operator_identifier <|> identifier) <* spaces)
-            <*> series (string "|") lambda
+term = try (DependentTerm <$> (try (depend_group <* (spaces <* string "=>") <* spaces)) <*> independent)
+   <|> independent
+  where depend_group :: Parsec String () [(CustomType, CustomType)]
+        depend_group = (char '(' *> spaces *> depends <* (spaces <* char ')')) <|> depends
+        depends :: Parsec String () [(CustomType, CustomType)]
+        depends = series (string ",") ((,) <$> (adt_name <* spaces) <*> (adt_name))
+        independent :: Parsec String () Term
+        independent = Term <$> data_type
+                           <*> ((operator_identifier <|> identifier) <* spaces)
+                           <*> series (string "|") lambda
 
 lambda :: Parsec String () Lambda
 lambda = Lambda <$> (space_series pattern)
