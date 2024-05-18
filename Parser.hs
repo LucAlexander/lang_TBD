@@ -3,7 +3,7 @@ module Main where
 import System.IO
 import System.Environment
 import Control.Monad
-import Data.Char (isLetter, isDigit)
+import Data.Char (isLetter, isDigit, toUpper)
 import qualified Data.Text as T
 import Data.Text (Text, pack, unpack, splitOn)
 import Text.Parsec
@@ -433,6 +433,70 @@ remove_block_comments program = (unpack . T.concat)
         fill_lines x = head x : (fmap (\xs -> pack (take ((length $ splitOn (pack "\n") $ head xs) - 1) $ repeat '\n') : (tail xs)) $ tail x)
 
 -- semantic analysis
+
+replace_namespace_type_alias :: Namespace -> Namespace
+replace_namespace_type_alias (Namespace namsp subspaces typeclasses data_structs aliases terms) =
+    Namespace namsp (map replace_namespace_type_alias subspaces)
+                    (map replace_typeclass_type_alias typeclasses)
+                    (map replace_data_type_alias data_structs)
+                    aliases
+                    (map replace_term_type_alias terms)
+  where look :: (String -> Maybe Type)
+        look = alias_lookup aliases
+          where alias_lookup :: [Alias] -> String -> Maybe Type
+                alias_lookup [] _ = Nothing
+                alias_lookup ((Alias s t):as) key = if s==key then Just t else alias_lookup as key
+
+        replace_typeclass_type_alias :: TypeClass -> TypeClass
+        replace_typeclass_type_alias (TypeClass deps name membs) = 
+            TypeClass deps name $ map convert membs
+          where convert :: (Type, Binding) -> (Type, Binding)
+                convert (t, b) = (replace_usr_type_alias t, b)
+        replace_typeclass_type_aliases (Implementation name t gens impls) = 
+            Implementation name t gens (map replace_term_type_alias impls)
+
+        replace_data_type_alias :: Data -> Data
+        replace_data_type_alias (Product t g membs) =
+            Product t g $ map replace_data_type_alias membs
+        replace_data_type_alias (Sum t g membs) =
+            Sum t g $ map replace_data_type_alias membs
+        replace_data_type_alias (Record t var_binding) =
+            Record (replace_usr_type_alias t) var_binding
+
+        replace_term_type_alias :: Term -> Term
+        replace_term_type_alias (Term tcons tname exprs) =
+            Term (replace_usr_type_alias tcons) tname (map replace_lam_type_alias exprs)
+        replace_term_type_alias (DependentTerm deps trm) =
+            DependentTerm deps (replace_term_type_alias trm)
+
+        replace_lam_type_alias :: Lambda -> Lambda
+        replace_lam_type_alias (Lambda args expr) =
+            Lambda args $ replace_expr_type_alias expr
+
+        replace_expr_type_alias :: Expression -> Expression
+        replace_expr_type_alias (Closure trm) = Closure $ replace_term_type_alias trm
+        replace_expr_type_alias (Anonymous lam) = Anonymous $ replace_lam_type_alias lam
+        replace_expr_type_alias (Return expr) = Return $ replace_expr_type_alias expr
+        replace_expr_type_alias (Block scope) = Block $ map replace_expr_type_alias scope
+        replace_expr_type_alias (If pred cond alt) = If (replace_expr_type_alias pred) (replace_expr_type_alias cond) (replace_expr_type_alias alt)
+        replace_expr_type_alias (Else alt) = Else $ replace_expr_type_alias alt
+        replace_expr_type_alias (Case expr cases) = Case (replace_expr_type_alias expr) (map convert_match cases)
+          where convert_match :: Match -> Match
+                convert_match (Match pat expr) = Match pat (replace_expr_type_alias expr)
+        replace_expr_type_alias other = other
+
+        -- for now we're only looking for empty generics, since TODO type aliases are not parametric
+        replace_usr_type_alias :: Type -> Type
+        replace_usr_type_alias original@(UsrType name []) =
+            case look name of
+                 Nothing -> original
+                 Just newType -> newType
+        replace_usr_type_alias (TermType a b) =
+            TermType (replace_usr_type_alias a) (replace_usr_type_alias b)
+        replace_usr_type_alias (Array t) =
+            Array $ replace_usr_type_alias t
+        replace_usr_type_alias other = other
+
 term_partial_structs :: Term -> Maybe Data
 term_partial_structs fun@(Term type_sig name exprs) =
     case (decons type_sig) of
@@ -450,7 +514,7 @@ term_partial_structs fun@(DependentTerm _ trm) = term_partial_structs trm
 
 preprocess :: Program -> Either String Program
 preprocess (Program mods (Namespace scope_name namespaces tclasses structs aliases terms)) =
-           Right $ Program mods $ Namespace scope_name namespaces tclasses (structs++add_partial_structs terms) aliases terms
+           Right $ Program mods $ replace_namespace_type_alias $ Namespace scope_name namespaces tclasses (structs++add_partial_structs terms) aliases terms
   where add_partial_structs :: [Term] -> [Data]
         add_partial_structs (t:ts) =
             case term_partial_structs t of
@@ -463,9 +527,14 @@ preprocess (Program mods (Namespace scope_name namespaces tclasses structs alias
 c_backend :: Interpreter
 c_backend program@(Program m (Namespace name n c d a t)) = putStrLn $ concat $ map c_data_generator d
 
+inter_comma :: [String] -> String
+inter_comma [] = []
+inter_comma [x] = x
+inter_comma (l:ls) = l ++ ',' : inter_comma ls
+
 c_data_generator :: Generator Data
-c_data_generator struct@(Product name _ members) = 
-    concat ["struct{enum{"
+c_data_generator struct@(Product name _ members) =
+    concat ["struct ",name,"{enum{"
            ,inter_comma $ map enumeration members
            ,"}tag;union{"
            ,concat $ map c_data_generator members
@@ -474,12 +543,8 @@ c_data_generator struct@(Product name _ members) =
         enumeration (Product n _ _) = n
         enumeration (Sum n _ _) = n
         enumeration r = concat ["encountered ", show r, "in enumeration for product type"]
-        inter_comma :: [String] -> String
-        inter_comma [] = []
-        inter_comma [x] = x
-        inter_comma (l:ls) = l ++ ',' : inter_comma ls
 c_data_generator struct@(Sum name _ members) =
-    concat ["struct{"
+    concat ["struct ",name,"{"
            ,concat $ map c_data_generator members
            ,"}", name, ";"]
 c_data_generator rec@(Record m_type m_name) = c_format_variable_name (" "++m_name) ";" m_type 
@@ -507,7 +572,7 @@ c_format_variable_name m_name separator m_type =
         flatten_compound_type (TermType a b) = concat ["P",flatten_compound_type a, "F",flatten_compound_type b,"P"]
         flatten_compound_type other = c_format_variable_name "" "" other
         user_type :: String -> String -> String
-        user_type usrname genrname = concat ["CTNUSR_", usrname, "G", genrname, m_name, separator]
+        user_type usrname genrname = concat [usrname, genrname, m_name, separator]
 
 c_member_type_generator :: Generator Type
 c_member_type_generator t =
