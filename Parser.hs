@@ -92,6 +92,9 @@ data Module = Include Filename deriving (Show)
 
 type Filename = String
 
+type Interpreter = Program -> IO ()
+type Generator a = a -> String
+
 suffix :: String
 suffix = ".idk"
 
@@ -429,20 +432,124 @@ remove_block_comments program = (unpack . T.concat)
   where fill_lines :: [[Text]] -> [[Text]]
         fill_lines x = head x : (fmap (\xs -> pack (take ((length $ splitOn (pack "\n") $ head xs) - 1) $ repeat '\n') : (tail xs)) $ tail x)
 
-parseProgram :: String -> IO ()
-parseProgram program =
+-- semantic analysis
+term_partial_structs :: Term -> Maybe Data
+term_partial_structs fun@(Term type_sig name exprs) =
+    case (decons type_sig) of
+         [a, b] -> Nothing
+         [a] -> Nothing
+         [] -> Nothing
+         record@(x:xs) -> Just $ Sum (name++"_partial") []
+                        $ (Record type_sig "term") : (map to_record (zip record [0..]))
+  where decons :: Type -> [Type]
+        decons (TermType a b) = a:decons b
+        decons x = [x]
+        to_record :: (Type, Int) -> Data 
+        to_record (t, index) = Record t $ "arg"++(show index)
+term_partial_structs fun@(DependentTerm _ trm) = term_partial_structs trm
+
+preprocess :: Program -> Either String Program
+preprocess (Program mods (Namespace scope_name namespaces tclasses structs aliases terms)) =
+           Right $ Program mods $ Namespace scope_name namespaces tclasses (structs++add_partial_structs terms) aliases terms
+  where add_partial_structs :: [Term] -> [Data]
+        add_partial_structs (t:ts) =
+            case term_partial_structs t of
+                  Just struct -> struct:add_partial_structs ts
+                  Nothing -> add_partial_structs ts
+        add_partial_structs [] = []
+
+-- backends
+
+c_backend :: Interpreter
+c_backend program@(Program m (Namespace name n c d a t)) = putStrLn $ concat $ map c_data_generator d
+
+c_data_generator :: Generator Data
+c_data_generator struct@(Product name _ members) = 
+    concat ["struct{enum{"
+           ,inter_comma $ map enumeration members
+           ,"}tag;union{"
+           ,concat $ map c_data_generator members
+           ,"}unwrap;}", name, ";"]
+  where enumeration :: Data -> String
+        enumeration (Product n _ _) = n
+        enumeration (Sum n _ _) = n
+        enumeration r = concat ["encountered ", show r, "in enumeration for product type"]
+        inter_comma :: [String] -> String
+        inter_comma [] = []
+        inter_comma [x] = x
+        inter_comma (l:ls) = l ++ ',' : inter_comma ls
+c_data_generator struct@(Sum name _ members) =
+    concat ["struct{"
+           ,concat $ map c_data_generator members
+           ,"}", name, ";"]
+c_data_generator rec@(Record m_type m_name) = c_format_variable_name (" "++m_name) ";" m_type 
+
+c_format_variable_name :: String -> String -> Type -> String
+c_format_variable_name m_name separator m_type =
+    case m_type of
+         TermType _ _ -> function_pointer $ flatten_term_type m_type
+         Array subtype -> array_type $ flatten_compound_type subtype 
+         UsrType usr_name generic_names -> user_type usr_name $ concat $ map (c_format_variable_name "" "") $ generic_names
+         ExternType scopes realtype -> concat ["CTNEXT_", concat $ scopes, "N", c_format_variable_name m_name separator realtype]
+         TypeErr _ -> "type parsing error"
+         _ -> concat [c_member_type_generator m_type, m_name, separator]
+  where function_pointer :: [Type] -> String
+        function_pointer flat = concat [c_format_variable_name "" "" $ last flat
+                                       ,"(*",m_name,")("
+                                       ,init $ concat $ map (c_format_variable_name "" ",") $ init flat
+                                       ,")" ,separator]
+        flatten_term_type :: Type -> [Type]
+        flatten_term_type (TermType a b) = a:flatten_term_type b
+        flatten_term_type t = [t]
+        array_type :: String -> String
+        array_type subtype = concat ["CTNSTARR_", subtype, m_name, separator]
+        flatten_compound_type :: Type -> String
+        flatten_compound_type (TermType a b) = concat ["P",flatten_compound_type a, "F",flatten_compound_type b,"P"]
+        flatten_compound_type other = c_format_variable_name "" "" other
+        user_type :: String -> String -> String
+        user_type usrname genrname = concat ["CTNUSR_", usrname, "G", genrname, m_name, separator]
+
+c_member_type_generator :: Generator Type
+c_member_type_generator t =
+    case t of
+         Chr -> "char"
+         Bl -> "uint8_t"
+         F64 -> "double"
+         F32 -> "float"
+         I8 -> "int8_t"
+         I16 -> "int16_t"
+         I32 -> "int32_t"
+         I64 -> "int64_t"
+         U8 -> "uint8_t"
+         U16 -> "uint16_t"
+         U32 -> "uint32_t"
+         U64 -> "uint64_t"
+         _ -> "unknown type"
+
+c_term_generator :: Generator Term
+c_term_generator (Term t name guards) = "term unimplemented"
+c_term_generator (DependentTerm _ t) = c_term_generator t
+
+ast_backend :: Interpreter
+ast_backend (Program m (Namespace _ n c d a t)) = mapM_ pPrint m >> (putStrLn "\n")
+                                               >> mapM_ pPrint n >> (putStrLn "\n")
+                                               >> mapM_ pPrint c >> (putStrLn "\n")
+                                               >> mapM_ pPrint d >> (putStrLn "\n")
+                                               >> mapM_ pPrint a >> (putStrLn "\n")
+                                               >> mapM_ pPrint t >> (putStrLn "\n")
+
+compiler :: Interpreter -> String -> IO ()
+compiler compile program =
   case parse programFile "(unknown)" (remove_line_comments $ remove_block_comments program) of
        Left e -> putStrLn "Parse Error"
               >> print e
-       Right (Program m (Namespace _ n c d a t)) -> mapM_ pPrint m >> (putStrLn "\n")
-                                                 >> mapM_ pPrint n >> (putStrLn "\n")
-                                                 >> mapM_ pPrint c >> (putStrLn "\n")
-                                                 >> mapM_ pPrint d >> (putStrLn "\n")
-                                                 >> mapM_ pPrint a >> (putStrLn "\n")
-                                                 >> mapM_ pPrint t >> (putStrLn "\n")
+       Right p -> case preprocess p of
+                       Left e -> putStrLn "Semantic Analysis Error"
+                              >> print e
+                       Right ast -> compile ast
 
 main :: IO ()
 main = getArgs >>= \args ->
        case length args of
             0 -> putStrLn "provide source file"
-            _ -> readFile (head args) >>= parseProgram
+            _ -> readFile (head args) >>= (compiler c_backend)
