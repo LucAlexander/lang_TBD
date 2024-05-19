@@ -96,7 +96,7 @@ type Interpreter = Program -> IO ()
 type Generator a = a -> String
 
 suffix :: String
-suffix = ".idk"
+suffix = ".ctn"
 
 series :: Parsec String () String -> Parsec String () a -> Parsec String () [a]
 series separator parser = sepBy (parser <* spaces) (separator <* spaces)
@@ -434,6 +434,55 @@ remove_block_comments program = (unpack . T.concat)
 
 -- semantic analysis
 
+check_dup_decls :: Namespace -> Either String Namespace
+check_dup_decls glob@(Namespace namsp subspaces typeclasses data_structs aliases terms) =
+    case Right [] >>= (check_dupl check_term terms)
+                  >>= (check_dupl check_data data_structs)
+                  >>= (check_dupl check_class typeclasses)
+                  >>= (check_dupl check_alias aliases) of
+         Right _ -> Right glob
+         Left e -> Left e
+  where contains :: (Show a) => String -> [String] -> a -> ([String] -> Either String [String]) -> Either String [String]
+        contains item tabl full dip = 
+            if item `elem` tabl
+            then Left $ concat ["duplicate ", item, " definition: ", show full]
+            else dip $ item:tabl
+
+        check_dupl :: (a -> [String] -> Either String [String]) -> [a] -> [String] -> Either String [String]
+        check_dupl seq items start = foldl (>>=) (Right start) $ map seq items
+
+        check_term :: Term -> [String] -> Either String [String]
+        check_term full@(Term tcons tname texprs) tabl = contains tname tabl full $ dip_term $ map (\(Lambda _ ex) -> ex) texprs
+          where dip_term :: [Expression] -> [String] -> Either String [String]
+                dip_term [] newtable = Right newtable
+                dip_term (t:exprs) newtable =
+                    (case check_dupl check_term (aggr_terms t) newtable of
+                         Left err -> Left err
+                         Right _ -> Right newtable) >>= dip_term exprs
+
+                aggr_terms :: Expression -> [Term]
+                aggr_terms (Closure t) = [t]
+                aggr_terms (Application a b) = (aggr_terms a) ++ (aggr_terms b)
+                aggr_terms (Anonymous (Lambda _ e)) = aggr_terms e
+                aggr_terms (Return expr) = aggr_terms expr
+                aggr_terms (Block scope) = concat $ map aggr_terms $ scope 
+                aggr_terms (If pred cond alt) = (aggr_terms pred) ++ (aggr_terms cond) ++ (aggr_terms alt)
+                aggr_terms (Else alt) = aggr_terms alt
+                aggr_terms (Case expr cases) = (aggr_terms expr) ++ (concat $ map (\(Match _ e) -> aggr_terms e) cases)
+                aggr_terms _ = []
+
+        check_data :: Data -> [String] -> Either String [String]
+        check_data full@(Product pname _ membs) tabl = contains pname tabl full $ check_dupl check_data membs
+        check_data full@(Sum sname _ membs) tabl = contains sname tabl full $ check_dupl check_data membs
+        check_data _ tabl = Right tabl
+
+        check_class :: TypeClass -> [String] -> Either String [String]
+        check_class full@(TypeClass _ tcname _) tabl = contains tcname tabl full $ Right
+        check_class _ tabl = Right tabl
+
+        check_alias :: Alias -> [String] -> Either String [String]
+        check_alias full@(Alias aname _) tabl = contains aname tabl full $ Right
+
 replace_namespace_type_alias :: Namespace -> Namespace
 replace_namespace_type_alias (Namespace namsp subspaces typeclasses data_structs aliases terms) =
     Namespace namsp (map replace_namespace_type_alias subspaces)
@@ -514,7 +563,9 @@ term_partial_structs fun@(DependentTerm _ trm) = term_partial_structs trm
 
 preprocess :: Program -> Either String Program
 preprocess (Program mods (Namespace scope_name namespaces tclasses structs aliases terms)) =
-           Right $ Program mods $ replace_namespace_type_alias $ Namespace scope_name namespaces tclasses (structs++add_partial_structs terms) aliases terms
+           case check_dup_decls $ Namespace scope_name namespaces tclasses (structs++add_partial_structs terms) aliases terms of
+                Right uniq -> Right $ Program mods $ replace_namespace_type_alias $ uniq
+                Left e -> Left e
   where add_partial_structs :: [Term] -> [Data]
         add_partial_structs (t:ts) =
             case term_partial_structs t of
