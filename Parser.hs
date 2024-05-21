@@ -25,7 +25,7 @@ data Term = Term {
     typeCons :: Type,
     termName :: Binding,
     guardedExprs :: [Lambda]
-} |  DependentTerm [(CustomType, CustomType)] Term deriving (Show)
+} | DependentTerm [(CustomType, CustomType)] Term deriving (Show)
 
 data TypeClass = TypeClass [CustomType] CustomType [(Type, Binding)]
                | Implementation CustomType CustomType Generics [Term] deriving (Show)
@@ -433,9 +433,78 @@ remove_block_comments program = (unpack . T.concat)
         fill_lines x = head x : (fmap (\xs -> pack (take ((length $ splitOn (pack "\n") $ head xs) - 1) $ repeat '\n') : (tail xs)) $ tail x)
 
 -- semantic analysis
+--
+--generic_lifting :: Namespace -> Either String Namespace
+--generic_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases terms) =
+--    Right $ concat [data_structs
+--                   ,from_data data_structs
+--                   ,from_typeclasses typeclasses
+--                   ,from_terms terms]
+--  where from_data :: [Data] -> [Data]
+--        from_data structs = []
+--
+--        from_typeclasses :: [TypeClass] -> [Data]
+--        from_typeclasses classes = []
+--
+--        from_terms :: [Term] -> [Data]
+--        from_terms terms = []
 
-check_dup_decls :: Namespace -> Either String Namespace
-check_dup_decls glob@(Namespace namsp subspaces typeclasses data_structs aliases terms) =
+lambda_lifting :: Namespace -> Either String Namespace
+lambda_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases terms) = Right glob
+
+closure_lifting :: Namespace -> Either String Namespace
+closure_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases terms) =
+    Right $ Namespace namsp subspaces typeclasses data_structs aliases $ terms >>= lift_terms
+  where lift_terms :: Term -> [Term]
+        lift_terms (DependentTerm scope trm@(Term _ _ lams)) =
+            let zipped = descend lams
+            in (DependentTerm scope $ replace_imputed trm $ map fst zipped):(concat $ map snd zipped)
+        lift_terms trm@(Term _ _ lams) =
+            let zipped = descend lams
+            in (replace_imputed trm $ map fst zipped):(concat $ map snd zipped)
+
+        replace_imputed :: Term -> [Expression] -> Term
+        replace_imputed trm@(Term typ nam lams) zipped =
+            Term typ nam $ map (\((Lambda args _), nexpr) -> Lambda args nexpr)
+                         $ zip lams zipped
+
+        descend :: [Lambda] -> [(Expression, [Term])]
+        descend lams = map (\(Lambda _ expr) -> scrape expr) lams
+
+        scrape :: Expression -> (Expression, [Term])
+        scrape clsr@(Closure t@(Term typ _ lams)) =
+            case typ of
+                 TermType _ _ -> (Nop, lift_terms t)
+                 _ -> let zipped = descend lams
+                      in ((Closure $ replace_imputed t $ map fst zipped),concat $ map snd zipped)
+        scrape (Anonymous (Lambda args expr)) =
+            let (new, coll) = scrape expr
+            in (Anonymous (Lambda args new), coll)
+        scrape (Block scope) =
+            let zipped = map scrape scope
+            in (Block $ map fst zipped, concat $ map snd zipped)
+        scrape (If pred cond alt) =
+            let zipped@[(npred,_)
+                       ,(ncond,_)
+                       ,(nalt,_)] = map scrape [pred, cond, alt]
+            in (If npred ncond nalt, concat $ map snd zipped)
+        scrape (Else alt) =
+            let (new, coll) = scrape alt
+            in (Else new, coll)
+        scrape (Case pred cases) =
+            let (npred, cpred) = scrape pred
+                zipped = map (\(Match _ expr) -> scrape expr) cases
+            in (Case npred (map (\((Match args _),imputee) -> Match args imputee)
+                          $ zip cases
+                          $ map fst zipped)
+               ,cpred ++ (concat $ map snd zipped))
+        scrape (Return expr) =
+            let (new, coll) = scrape expr
+            in (Return new, coll)
+        scrape other = (other, [])
+
+check_dup_decls :: Namespace -> Either String Namespace -- TODO extern namespaces
+check_dup_decls glob@(Namespace _ subspaces typeclasses data_structs aliases terms) =
     case Right [] >>= (check_dupl check_term terms)
                   >>= (check_dupl check_data data_structs)
                   >>= (check_dupl check_class typeclasses)
@@ -563,7 +632,10 @@ term_partial_structs fun@(DependentTerm _ trm) = term_partial_structs trm
 
 preprocess :: Program -> Either String Program
 preprocess (Program mods (Namespace scope_name namespaces tclasses structs aliases terms)) =
-           case check_dup_decls $ Namespace scope_name namespaces tclasses (structs++add_partial_structs terms) aliases terms of
+           case (check_dup_decls $ Namespace scope_name namespaces tclasses (structs++add_partial_structs terms) aliases terms)
+                >>= closure_lifting
+                >>= lambda_lifting of
+--                >>= generic_lifting of
                 Right uniq -> Right $ Program mods $ replace_namespace_type_alias $ uniq
                 Left e -> Left e
   where add_partial_structs :: [Term] -> [Data]
@@ -668,4 +740,4 @@ main :: IO ()
 main = getArgs >>= \args ->
        case length args of
             0 -> putStrLn "provide source file"
-            _ -> readFile (head args) >>= (compiler c_backend)
+            _ -> readFile (head args) >>= (compiler ast_backend)
