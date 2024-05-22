@@ -452,42 +452,60 @@ remove_block_comments program = (unpack . T.concat)
 lambda_lifting :: Namespace -> Either String Namespace
 lambda_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases terms) = Right glob
 
+-- TODO function to descend over closures and add arguments to their lambdas for captured values in the scope. add those args to applications of that closure within the scope
+-- this happens right before closure_lifting
+
 closure_lifting :: Namespace -> Either String Namespace
 closure_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases terms) =
     Right $ Namespace namsp subspaces typeclasses data_structs aliases $ terms >>= lift_terms
   where lift_terms :: Term -> [Term]
-        lift_terms (DependentTerm scope trm@(Term _ _ lams)) =
+        lift_terms (DependentTerm scope trm@(Term _ nam lams)) =
             let zipped = descend lams
-            in (DependentTerm scope $ replace_imputed trm $ map fst zipped):(concat $ map snd zipped)
-        lift_terms trm@(Term _ _ lams) =
+                renamer = rename nam
+            in (DependentTerm scope $ replace_imputed trm $ map fst zipped):(map renamer $ take_terms zipped)
+        lift_terms trm@(Term _ nam lams) =
             let zipped = descend lams
-            in (replace_imputed trm $ map fst zipped):(concat $ map snd zipped)
+                renamer = rename nam
+            in (replace_imputed trm $ map fst zipped):(map renamer $ take_terms zipped)
+
+        take_terms :: [(Expression, [Term])] -> [Term]
+        take_terms zipped = concat $ map snd zipped
 
         replace_imputed :: Term -> [Expression] -> Term
         replace_imputed trm@(Term typ nam lams) zipped =
             Term typ nam $ map (\((Lambda args _), nexpr) -> Lambda args nexpr)
                          $ zip lams zipped
+        replace_imputed (DependentTerm scope trm) zipped =
+            DependentTerm scope $ replace_imputed trm zipped
 
         descend :: [Lambda] -> [(Expression, [Term])]
         descend lams = map (\(Lambda _ expr) -> scrape expr) lams
 
-        scrape :: Expression -> (Expression, [Term])
-        scrape clsr@(Closure t@(Term typ _ lams)) =
+        rename :: String -> Term -> Term
+        rename newname (Term typ old lams) = Term typ (concat ["RN", newname, old]) lams
+        rename newname (DependentTerm scope trm) = DependentTerm scope $ rename newname trm
+
+        lift_closure :: Term -> Term -> (Expression, [Term])
+        lift_closure outer t@(Term typ nam lams) = 
             case typ of
                  TermType _ _ -> (Nop, lift_terms t)
                  _ -> let zipped = descend lams
-                      in ((Closure $ replace_imputed t $ map fst zipped),concat $ map snd zipped)
+                      in ((Closure $ replace_imputed outer $ map fst zipped),take_terms zipped)
+
+        scrape :: Expression -> (Expression, [Term])
+        scrape (Closure t@(Term typ nam lams)) = lift_closure t t
+        scrape (Closure t@(DependentTerm scope trm@(Term typ nam lams))) = lift_closure t trm
         scrape (Anonymous (Lambda args expr)) =
             let (new, coll) = scrape expr
             in (Anonymous (Lambda args new), coll)
         scrape (Block scope) =
             let zipped = map scrape scope
-            in (Block $ map fst zipped, concat $ map snd zipped)
+            in (Block $ map fst zipped, take_terms zipped)
         scrape (If pred cond alt) =
             let zipped@[(npred,_)
                        ,(ncond,_)
                        ,(nalt,_)] = map scrape [pred, cond, alt]
-            in (If npred ncond nalt, concat $ map snd zipped)
+            in (If npred ncond nalt, take_terms zipped)
         scrape (Else alt) =
             let (new, coll) = scrape alt
             in (Else new, coll)
@@ -497,7 +515,7 @@ closure_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases
             in (Case npred (map (\((Match args _),imputee) -> Match args imputee)
                           $ zip cases
                           $ map fst zipped)
-               ,cpred ++ (concat $ map snd zipped))
+               ,cpred ++ (take_terms zipped))
         scrape (Return expr) =
             let (new, coll) = scrape expr
             in (Return new, coll)
@@ -553,7 +571,7 @@ check_dup_decls glob@(Namespace _ subspaces typeclasses data_structs aliases ter
         check_alias full@(Alias aname _) tabl = contains aname tabl full $ Right
 
 replace_namespace_type_alias :: Namespace -> Namespace
-replace_namespace_type_alias (Namespace namsp subspaces typeclasses data_structs aliases terms) =
+replace_namespace_type_alias start@(Namespace namsp subspaces typeclasses data_structs aliases terms) =
     Namespace namsp (map replace_namespace_type_alias subspaces)
                     (map replace_typeclass_type_alias typeclasses)
                     (map replace_data_type_alias data_structs)
@@ -615,35 +633,41 @@ replace_namespace_type_alias (Namespace namsp subspaces typeclasses data_structs
             Array $ replace_usr_type_alias t
         replace_usr_type_alias other = other
 
-term_partial_structs :: Term -> Maybe Data
-term_partial_structs fun@(Term type_sig name exprs) =
-    case (decons type_sig) of
-         [a, b] -> Nothing
-         [a] -> Nothing
-         [] -> Nothing
-         record@(x:xs) -> Just $ Sum (name++"_partial") []
-                        $ (Record type_sig "term") : (map to_record (zip record [0..]))
-  where decons :: Type -> [Type]
-        decons (TermType a b) = a:decons b
-        decons x = [x]
-        to_record :: (Type, Int) -> Data 
-        to_record (t, index) = Record t $ "arg"++(show index)
-term_partial_structs fun@(DependentTerm _ trm) = term_partial_structs trm
+add_partial_structs :: Namespace -> Either String Namespace
+add_partial_structs (Namespace namsp subspaces typeclasses data_structs aliases terms) =
+    Right $ Namespace namsp subspaces typeclasses (data_structs ++ pull_partial terms) aliases terms
+  where pull_partial :: [Term] -> [Data]
+        pull_partial (t:ts) =
+            case term_partial_structs t of
+                  Just struct -> struct:pull_partial ts
+                  Nothing -> pull_partial ts
+        pull_partial [] = []
+
+        term_partial_structs :: Term -> Maybe Data
+        term_partial_structs fun@(Term type_sig name exprs) =
+            case (decons type_sig) of
+                 [a, b] -> Nothing
+                 [a] -> Nothing
+                 [] -> Nothing
+                 record@(x:xs) -> Just $ Sum (name++"_partial") []
+                                $ (Record type_sig "term") : (map to_record (zip record [0..]))
+          where decons :: Type -> [Type]
+                decons (TermType a b) = a:decons b
+                decons x = [x]
+                to_record :: (Type, Int) -> Data 
+                to_record (t, index) = Record t $ "arg"++(show index)
+        term_partial_structs fun@(DependentTerm _ trm) = term_partial_structs trm
 
 preprocess :: Program -> Either String Program
-preprocess (Program mods (Namespace scope_name namespaces tclasses structs aliases terms)) =
-           case (check_dup_decls $ Namespace scope_name namespaces tclasses (structs++add_partial_structs terms) aliases terms)
-                >>= closure_lifting
-                >>= lambda_lifting of
---                >>= generic_lifting of
-                Right uniq -> Right $ Program mods $ replace_namespace_type_alias $ uniq
+preprocess (Program mods global) =
+           case foldl (>>=) (Right $ replace_namespace_type_alias global)
+                      [add_partial_structs
+                      ,check_dup_decls
+                      ,closure_lifting
+                      ,lambda_lifting] of
+--                 >>= generic_lifting of
+                Right uniq -> Right $ Program mods uniq
                 Left e -> Left e
-  where add_partial_structs :: [Term] -> [Data]
-        add_partial_structs (t:ts) =
-            case term_partial_structs t of
-                  Just struct -> struct:add_partial_structs ts
-                  Nothing -> add_partial_structs ts
-        add_partial_structs [] = []
 
 -- backends
 
