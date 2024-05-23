@@ -452,6 +452,86 @@ remove_block_comments program = (unpack . T.concat)
 lambda_lifting :: Namespace -> Either String Namespace
 lambda_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases terms) = Right glob
 
+rename_in_scope :: String -> String -> Expression -> Expression
+rename_in_scope old new expr =
+    case expr of
+         (Closure trm) -> Closure $ rename_term trm
+         (Application a b) -> Application (descend a) (descend b)
+         (Anonymous lam) -> Anonymous $ rename_lambda lam
+         (BoundName cand) -> BoundName $ change cand
+         (BoundOperator cand) -> BoundOperator $ change cand
+         (StructAccess cand) -> StructAccess $ change cand
+         (NamespaceAccess chain cand) -> NamespaceAccess (map change chain) $ change cand
+         (Return expr) -> Return $ descend expr
+         (Block scope) -> Block $ map descend scope
+         (If pred cond alt) -> If (descend pred) (descend cond) (descend alt)
+         (Else alt) -> Else $ descend alt
+         (Case expr matches) -> Case (descend expr) $ map (\(Match pat expr) ->
+                                                             Match (rename_pattern pat) $ descend expr
+                                                          ) matches
+         (LiteralPattern pat) -> LiteralPattern $ rename_pattern pat
+         _ -> expr
+         
+  where change :: String -> String
+        change cand = change_string old new cand
+
+        rename_term ex = rename_in_term old new ex
+        rename_lambda ex = rename_in_lambda old new ex
+        rename_pattern ex = rename_in_pattern old new ex
+
+        descend :: Expression -> Expression
+        descend expr = rename_in_scope old new expr
+
+change_string :: String -> String -> String -> String
+change_string old new cand = if old == cand then new else cand
+
+rename_in_term :: String -> String -> Term -> Term
+rename_in_term old new (Term typ nam lams) =
+    Term (rename_type typ) (change_string old new nam) $ map rename_lambda lams
+  where rename_lambda ex = rename_in_lambda old new ex
+        rename_type ex = rename_in_type old new ex
+rename_in_term old new (DependentTerm deps inner) =
+    DependentTerm (map (\(a, b) -> ((change_string old new a), b)) deps) $ rename_term inner
+  where rename_term ex = rename_in_term old new ex
+
+rename_in_lambda :: String -> String -> Lambda -> Lambda
+rename_in_lambda old new (Lambda args expr) = Lambda (map rename_pattern args) $ descend expr
+  where rename_pattern ex = rename_in_pattern old new ex
+
+        descend :: Expression -> Expression
+        descend expr = rename_in_scope old new expr
+
+rename_in_pattern :: String -> String -> Pattern -> Pattern
+rename_in_pattern old new pttrn =
+    case pttrn of
+         (Shape pats) -> Shape $ map rename_pattern pats
+         (ReferenceShape nam pat) -> ReferenceShape (change nam) (rename_pattern pat)
+         (ExternTypeAnchor chain nam) -> ExternTypeAnchor (map change chain) $ change nam
+         (TypeAnchor typ) -> TypeAnchor $ change typ
+         (LitAnchor lit) -> LitAnchor $ rename_literal lit
+         (ArrayPattern membs) -> ArrayPattern $ map rename_pattern membs
+         (Anchor nam) -> Anchor $ change nam
+  where rename_pattern ex = rename_in_pattern old new ex
+        rename_literal ex = rename_in_literal old new ex
+        change cand = change_string old new cand
+
+rename_in_literal :: String -> String -> Literal -> Literal
+rename_in_literal old new (ArrayLiteral membs) = ArrayLiteral $ map descend membs
+  where descend :: Expression -> Expression
+        descend expr = rename_in_scope old new expr
+rename_in_literal _ _ other = other
+
+rename_in_type :: String -> String -> Type -> Type
+rename_in_type old new type_cand =
+    case type_cand of
+         (TermType a b) -> TermType (rename_type a) (rename_type b)
+         (Array typ) -> Array $ rename_type typ
+         (UsrType nam gens) -> UsrType (change nam) (map rename_type gens)
+         (ExternType chain typ) -> ExternType (map change chain) $ rename_type typ
+         _ -> type_cand
+  where rename_type ex = rename_in_type old new ex
+        change cand = change_string old new cand
+
 -- TODO function to descend over closures and add arguments to their lambdas for captured values in the scope. add those args to applications of that closure within the scope
 -- this happens right before closure_lifting
 
@@ -462,11 +542,11 @@ closure_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases
         lift_terms (DependentTerm scope trm@(Term _ nam lams)) =
             let zipped = descend lams
                 renamer = rename nam
-            in (DependentTerm scope $ replace_imputed trm $ map fst zipped):(map renamer $ take_terms zipped)
+            in (DependentTerm scope $ renamer $ replace_imputed trm $ map fst zipped):(map renamer $ take_terms zipped)
         lift_terms trm@(Term _ nam lams) =
             let zipped = descend lams
                 renamer = rename nam
-            in (replace_imputed trm $ map fst zipped):(map renamer $ take_terms zipped)
+            in (renamer $ replace_imputed trm $ map fst zipped):(map renamer $ take_terms zipped)
 
         take_terms :: [(Expression, [Term])] -> [Term]
         take_terms zipped = concat $ map snd zipped
@@ -488,7 +568,7 @@ closure_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases
         lift_closure :: Term -> Term -> (Expression, [Term])
         lift_closure outer t@(Term typ nam lams) = 
             case typ of
-                 TermType _ _ -> (Nop, lift_terms t)
+                 TermType _ _ -> (Nop, lift_terms outer)
                  _ -> let zipped = descend lams
                       in ((Closure $ replace_imputed outer $ map fst zipped),take_terms zipped)
 
@@ -499,8 +579,28 @@ closure_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases
             let (new, coll) = scrape expr
             in (Anonymous (Lambda args new), coll)
         scrape (Block scope) =
-            let zipped = map scrape scope
+            let zipped = walk scope
             in (Block $ map fst zipped, take_terms zipped)
+          where walk :: Scope -> [(Expression, [Term])]
+                walk (e:es) =
+                    let zipped@(new, col) = scrape e
+                    in case (e, new, col) of
+                            (Closure ol, Nop, trms@(nw:ts)) -> -- TODO nw has old name
+                                (Nop, map (rename_term ol nw) trms):(walk $ map (rename_scope ol nw) es)
+                            _ -> zipped:(walk es)
+                walk [] = []
+
+                rename_term :: Term -> Term -> Term -> Term
+                rename_term old_term new_term term_ex =
+                    rename_in_term (extract old_term) (extract new_term) term_ex
+
+                rename_scope :: Term -> Term -> Expression -> Expression
+                rename_scope old_term new_term block_scope =
+                    rename_in_scope (extract old_term) (extract new_term) block_scope
+
+                extract :: Term -> String
+                extract (Term _ n _) = n
+                extract (DependentTerm _ n) = extract n
         scrape (If pred cond alt) =
             let zipped@[(npred,_)
                        ,(ncond,_)
@@ -557,6 +657,7 @@ check_dup_decls glob@(Namespace _ subspaces typeclasses data_structs aliases ter
                 aggr_terms (Else alt) = aggr_terms alt
                 aggr_terms (Case expr cases) = (aggr_terms expr) ++ (concat $ map (\(Match _ e) -> aggr_terms e) cases)
                 aggr_terms _ = []
+        check_term full@(DependentTerm deps trm) tabl = check_term trm tabl
 
         check_data :: Data -> [String] -> Either String [String]
         check_data full@(Product pname _ membs) tabl = contains pname tabl full $ check_dupl check_data membs
