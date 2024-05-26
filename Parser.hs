@@ -4,6 +4,7 @@ import System.IO
 import System.Environment
 import Control.Monad
 import Data.Char (isLetter, isDigit, toUpper, chr)
+import qualified Data.Map as Map
 import qualified Data.Text as T
 import Data.Text (Text, pack, unpack, splitOn)
 import Text.Parsec
@@ -94,6 +95,8 @@ type Filename = String
 
 type Interpreter = Program -> IO ()
 type Generator a = a -> String
+
+type Lookup a = Map.Map String a
 
 suffix :: String
 suffix = ".ctn"
@@ -433,24 +436,6 @@ remove_block_comments program = (unpack . T.concat)
         fill_lines x = head x : (fmap (\xs -> pack (take ((length $ splitOn (pack "\n") $ head xs) - 1) $ repeat '\n') : (tail xs)) $ tail x)
 
 -- semantic analysis
---
---generic_lifting :: Namespace -> Either String Namespace
---generic_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases terms) =
---    Right $ concat [data_structs
---                   ,from_data data_structs
---                   ,from_typeclasses typeclasses
---                   ,from_terms terms]
---  where from_data :: [Data] -> [Data]
---        from_data structs = []
---
---        from_typeclasses :: [TypeClass] -> [Data]
---        from_typeclasses classes = []
---
---        from_terms :: [Term] -> [Data]
---        from_terms terms = []
-
-lambda_lifting :: Namespace -> Either String Namespace
-lambda_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases terms) = Right glob
 
 rename_in_scope :: String -> String -> Expression -> Expression
 rename_in_scope old new expr =
@@ -549,16 +534,20 @@ rename_in_type old new type_cand =
 
 closure_lifting :: Namespace -> Either String Namespace
 closure_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases terms) =
-    Right $ Namespace namsp subspaces typeclasses data_structs aliases $ terms >>= lift_terms []
-  where lift_terms :: [String] -> Term -> [Term]
-        lift_terms scope_chain (DependentTerm scope trm@(Term _ nam lams)) =
-            let zipped = descend (add_chain scope_chain nam) lams
+    Right $ Namespace namsp subspaces typeclasses data_structs aliases $ terms >>= lift_terms [] []
+  where lift_terms :: [String] -> [(CustomType, CustomType)] -> Term -> [Term]
+        lift_terms scope_chain curr_dep (DependentTerm dep trm@(Term _ nam lams)) =
+            let zipped = descend (add_chain scope_chain nam) (curr_dep ++ dep) lams
                 renamer = rename $ concat $ scope_chain++[nam]
-            in (DependentTerm scope $ renamer $ replace_imputed trm $ map fst zipped):(take_terms zipped)
-        lift_terms scope_chain trm@(Term _ nam lams) =
-            let zipped = descend (add_chain scope_chain nam) lams
+            in case curr_dep of
+                    [] -> (DependentTerm dep $ renamer $ replace_imputed trm $ map fst zipped):(take_terms zipped)
+                    _ -> (DependentTerm (curr_dep++dep) $ renamer $ replace_imputed trm $ map fst zipped):(take_terms zipped)
+        lift_terms scope_chain curr_dep trm@(Term _ nam lams) =
+            let zipped = descend (add_chain scope_chain nam) curr_dep lams
                 renamer = rename $ concat $ scope_chain++[nam]
-            in (renamer $ replace_imputed trm $ map fst zipped):(take_terms zipped)
+            in case curr_dep of
+                    [] -> (renamer $ replace_imputed trm $ map fst zipped):(take_terms zipped)
+                    _ -> (DependentTerm curr_dep $ renamer $ replace_imputed trm $ map fst zipped):(take_terms zipped)
 
         add_chain :: [String] -> String -> [String]
         add_chain scope_chain nam = scope_chain ++ [nam ++ ">"]
@@ -573,36 +562,40 @@ closure_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases
         replace_imputed (DependentTerm scope trm) zipped =
             DependentTerm scope $ replace_imputed trm zipped
 
-        descend :: [String] -> [Lambda] -> [(Expression, [Term])]
-        descend scope_chain lams = map (\((Lambda _ expr),grd) -> scrape (add_chain scope_chain $ show grd) expr) $ zip lams [1..]
+        descend :: [String] -> [(CustomType, CustomType)] -> [Lambda] -> [(Expression, [Term])]
+        descend scope_chain deps lams = map (\((Lambda _ expr),grd) -> scrape (add_chain scope_chain $ show grd) deps expr) $ zip lams [1..]
 
         rename :: String -> Term -> Term
         rename newname (Term typ old lams) = Term typ (concat ["[RN]", newname, old]) lams
         rename newname (DependentTerm scope trm) = DependentTerm scope $ rename newname trm
 
-        lift_closure :: [String] -> Term -> Term -> (Expression, [Term])
-        lift_closure scope_chain outer t@(Term typ nam lams) = 
+        lift_closure :: [String] -> [(CustomType, CustomType)] -> Term -> (Expression, [Term])
+        lift_closure scope_chain deps t@(Term typ nam lams) = 
             case typ of
-                 TermType _ _ -> (Nop, lift_terms scope_chain outer)
-                 _ -> let zipped = descend (add_chain scope_chain nam) lams
-                      in ((Closure $ replace_imputed outer $ map fst zipped),take_terms zipped)
+                 TermType _ _ -> (Nop, lift_terms scope_chain deps t)
+                 _ -> let zipped = descend (add_chain scope_chain nam) deps lams
+                      in ((Closure $ replace_imputed t $ map fst zipped),take_terms zipped)
+        lift_closure scope_chain deps t@(DependentTerm new_deps inner@(Term typ nam lams)) = 
+            case typ of
+                 TermType _ _ -> (Nop, lift_terms scope_chain deps t)
+                 _ -> let zipped = descend (add_chain scope_chain nam) (deps++new_deps) lams
+                      in ((Closure $ DependentTerm (deps++new_deps) $ replace_imputed inner $ map fst zipped),take_terms zipped)
 
-        scrape :: [String] -> Expression -> (Expression, [Term])
-        scrape scope_chain (Closure t@(Term typ nam lams)) = lift_closure scope_chain t t
-        scrape scope_chain (Closure t@(DependentTerm scope trm@(Term typ nam lams))) = lift_closure scope_chain t trm
-        scrape scope_chain (Application a b) = 
-            let (lnew, lcoll) = scrape (add_chain scope_chain "<L") a
-                (rnew, rcoll) = scrape (add_chain scope_chain "<R") b
+        scrape :: [String] -> [(CustomType, CustomType)] -> Expression -> (Expression, [Term])
+        scrape scope_chain deps (Closure t) = lift_closure scope_chain deps t
+        scrape scope_chain deps (Application a b) = 
+            let (lnew, lcoll) = scrape (add_chain scope_chain "<L") deps a
+                (rnew, rcoll) = scrape (add_chain scope_chain "<R") deps b
             in (Application lnew rnew, lcoll++rcoll)
-        scrape scope_chain (Anonymous (Lambda args expr)) =
-            let (new, coll) = scrape (add_chain scope_chain "<") expr
+        scrape scope_chain deps (Anonymous (Lambda args expr)) =
+            let (new, coll) = scrape (add_chain scope_chain "<") deps expr
             in (Anonymous (Lambda args new), coll)
-        scrape scope_chain (Block scope) =
+        scrape scope_chain deps (Block scope) =
             let zipped = walk $ zip scope [1..]
             in (Block $ map fst zipped, take_terms zipped)
           where walk :: [(Expression, Int)] -> [(Expression, [Term])]
                 walk ((e,ln):es) =
-                    let zipped@(new, col) = scrape (add_chain scope_chain $ "<S"++(show ln)) e
+                    let zipped@(new, col) = scrape (add_chain scope_chain $ "<S"++(show ln)) deps e
                     in case (e, new, col) of
                             (Closure ol, Nop, trms@(nw:ts)) ->
                                 (Nop, map (rename_term ol nw) trms):(walk $ map (\(e,l) -> (rename_scope ol nw e,l)) es)
@@ -620,25 +613,25 @@ closure_lifting glob@(Namespace namsp subspaces typeclasses data_structs aliases
                 extract :: Term -> String
                 extract (Term _ n _) = n
                 extract (DependentTerm _ n) = extract n
-        scrape scope_chain (If pred cond alt) =
-            let (npred,ptrm) = scrape (add_chain scope_chain "<prd") pred
-                (ncond,ctrm) = scrape (add_chain scope_chain "<cnd") cond
-                (nalt,atrm) = scrape (add_chain scope_chain "<alt") alt
+        scrape scope_chain deps (If pred cond alt) =
+            let (npred,ptrm) = scrape (add_chain scope_chain "<prd") deps pred
+                (ncond,ctrm) = scrape (add_chain scope_chain "<cnd") deps cond
+                (nalt,atrm) = scrape (add_chain scope_chain "<alt") deps alt
             in (If npred ncond nalt, concat [ptrm, ctrm, atrm])
-        scrape scope_chain (Else alt) =
-            let (new, coll) = scrape scope_chain alt
+        scrape scope_chain deps (Else alt) =
+            let (new, coll) = scrape scope_chain deps alt
             in (Else new, coll)
-        scrape scope_chain (Case pred cases) =
-            let (npred, cpred) = scrape (add_chain scope_chain "<cprd") pred
-                zipped = map (\((Match _ expr),mc) -> scrape (add_chain scope_chain $ "<C"++(show mc)) expr) $ zip cases [1..]
+        scrape scope_chain deps (Case pred cases) =
+            let (npred, cpred) = scrape (add_chain scope_chain "<cprd") deps pred
+                zipped = map (\((Match _ expr),mc) -> scrape (add_chain scope_chain $ "<C"++(show mc)) deps expr) $ zip cases [1..]
             in (Case npred (map (\((Match args _),imputee) -> Match args imputee)
                           $ zip cases
                           $ map fst zipped)
                ,cpred ++ (take_terms zipped))
-        scrape scope_chain (Return expr) =
-            let (new, coll) = scrape (add_chain scope_chain "<ret") expr
+        scrape scope_chain deps (Return expr) =
+            let (new, coll) = scrape (add_chain scope_chain "<ret") deps expr
             in (Return new, coll)
-        scrape _ other = (other, [])
+        scrape _ _ other = (other, [])
 
 check_dup_decls :: Namespace -> Either String Namespace -- TODO extern namespaces
 check_dup_decls glob@(Namespace _ subspaces typeclasses data_structs aliases terms) =
@@ -778,16 +771,101 @@ add_partial_structs (Namespace namsp subspaces typeclasses data_structs aliases 
                 to_record (t, index) = Record t $ "arg"++(show index)
         term_partial_structs fun@(DependentTerm _ trm) = term_partial_structs trm
 
-preprocess :: Program -> Either String Program
-preprocess (Program mods global) =
-    case foldl (>>=) (Right $ replace_namespace_type_alias global)
-               [closure_lifting
-               ,add_partial_structs
-               ,check_dup_decls
-               ,lambda_lifting] of
---           >>= generic_lifting of
+--semantic_pass :: Program -> Either String AST
+semantic_pass (Program mods (Namespace name subspaces typeclasses structs aliases terms)) =
+    let term_map = (collect terms termName)
+        struct_map = (collect structs structName)
+    in foldl (\acc x -> acc >>= (pass_term x)) (Right (term_map, struct_map)) terms
+  where collect :: [a] -> (a -> String) -> Lookup a
+        collect xs getName = foldl (\lkup x -> Map.insert (getName x) x lkup) Map.empty xs
+
+        termName :: Term -> String
+        termName (Term _ nam _) = nam
+        termName (DependentTerm _ trm) = termName trm
+
+        structName :: Data -> String
+        structName (Product nam _ _) = nam
+        structName (Sum nam _ _) = nam
+
+pass_term :: Term -> (Lookup Term, Lookup Data) -> Either String (Lookup Term, Lookup Data)
+pass_term trm pair@(term_map, struct_map) =
+    (\sm -> case sm of
+                 Right x -> Right (term_map, x)
+                 Left e -> Left e
+    )
+    (case trm of
+         Term typ nam lams -> validate_type typ struct_map
+         (DependentTerm deps (Term typ nam lams)) -> validate_type typ struct_map)
+
+validate_type :: Type -> Lookup Data -> Either String (Lookup Data)
+validate_type typ tabl =
+    case typ of
+         (TermType a b) -> validate_type a tabl >>= validate_type b
+         (Array t) -> validate_type t tabl -- TODO create new array type in tabl if needed
+         (UsrType _ _) -> validate_usr_type typ tabl
+         _ -> Right tabl -- TODO extern unimplemented
+  where validate_usr_type :: Type -> Lookup Data -> Either String (Lookup Data)
+        validate_usr_type (UsrType name gens) lkup =
+            let validator = validate_generics lkup name gens
+            in case Map.lookup name lkup of
+                 Just struct@(Product _ g _) -> validator g struct
+                 Just struct@(Sum _ g _) -> validator g struct
+                 _ -> Left $ "No data type defined with name: " ++ name
+
+        validate_generics :: Lookup Data -> String -> [Type] -> Generics -> Data -> Either String (Lookup Data)
+        validate_generics lkup name gens g mold =
+            let attempt = length gens
+                real = length g
+            in if attempt == real
+            then case foldl (>>=) (Right lkup) $ map validate_type gens of
+                      Right valid -> (\new_name ->
+                          case Map.lookup new_name lkup of
+                               Just _ -> Right lkup
+                               Nothing -> Right $ Map.insert new_name (forge_struct mold gens new_name) lkup) $ rename_struct name gens
+                      error -> error
+            else Left $ concat ["data type ",name," requires ",show real
+                               ," generic type arguments, but ",show attempt
+                               ," were provided.\nExpecting: ",show g
+                               ,"\nRecieved: ",show gens]
+
+        rename_struct :: String -> [Type] -> String
+        rename_struct old_name params = concat $ [old_name,"[GN]",concat $ map type_name params]
+
+        forge_struct :: Data -> [Type] -> String -> Data
+        forge_struct data_struct params new_name =
+            case data_struct of
+                 (Product _ old_gens membs) -> Product new_name [] $ map (descend params old_gens) membs
+                 (Sum _ old_gens membs) -> Sum new_name [] $ map (descend params old_gens) membs
+          where descend :: [Type] -> [CustomType] -> Data -> Data
+                descend new_params old_markers memb =
+                    case memb of
+                         (Sum n g m) -> Sum n g $ map (descend new_params old_markers) m
+                         target@(Record (UsrType cand _) n) ->
+                             case get_new_type new_params old_markers cand of
+                                  Just impute -> Record impute n
+                                  Nothing -> target
+                         _ -> memb
+
+                get_new_type :: [Type] -> [CustomType] -> CustomType ->  Maybe Type
+                get_new_type (p:ps) (c:cs) cand =
+                    if cand == c
+                    then Just p
+                    else get_new_type ps cs cand
+                get_new_type _ _ _ = Nothing
+
+        type_name :: Type -> String
+        type_name (UsrType name _) = name
+
+analysis :: Program -> Either String Program
+analysis (Program mods global) =
+    case preprocess of
          Right uniq -> Right $ Program mods uniq
          Left e -> Left e
+  where preprocess :: Either String Namespace
+        preprocess = foldl (>>=) (Right $ replace_namespace_type_alias global)
+                     [closure_lifting
+                     ,add_partial_structs
+                     ,check_dup_decls]
 
 -- backends
 
@@ -875,7 +953,7 @@ compiler compile program =
   case parse programFile "(unknown)" (remove_line_comments $ remove_block_comments program) of
        Left e -> putStrLn "Parse Error"
               >> print e
-       Right p -> case preprocess p of
+       Right p -> case analysis p of
                        Left e -> putStrLn "Semantic Analysis Error"
                               >> print e
                        Right ast -> compile ast
