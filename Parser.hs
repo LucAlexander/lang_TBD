@@ -85,11 +85,22 @@ data Definition = TermDef Term
 
 data Literal = Integral Int
              | Float Double
+             | Boolean Bool
              | CharString String
              | ArrayLiteral [Expression]
              | CharSingle Char deriving (Show)
 
 data Module = Include Filename deriving (Show)
+
+data Env = Env {
+    terms :: Lookup Term,
+    constructors :: Lookup [Ctor],
+    complete_structs :: Lookup Data,
+    generic_structs :: Lookup Data,
+    symbol_table :: Lookup Type
+}
+
+data Ctor = Ctor Data
 
 type Filename = String
 
@@ -177,7 +188,8 @@ comment = (try $ string "//" *> (many anyChar) <* char '\n')
       <|> (try $ string "/*" *> (many anyChar) <* string "*/")
 
 literal :: Parsec String () Literal
-literal = (CharString <$> try (char '"' *> many charac <* char '"'))
+literal = (Boolean . to_bool <$> try $ (string "True") <|> (string "False"))
+      <|> (CharString <$> try (char '"' *> many charac <* char '"'))
       <|> (CharSingle <$> try (char '\'' *> anyChar <* char '\''))
       <|> (Float <$> try (ap sign floating))
       <|> (Integral <$> try int)
@@ -189,6 +201,10 @@ literal = (CharString <$> try (char '"' *> many charac <* char '"'))
         array_comps = try applicable_control_flow
                   <|> block_expression
                   <|> application 
+
+        to_bool :: String -> Bool
+        to_bool "True" = True
+        to_bool "False" = False
 
 term :: Parsec String () Term
 term = try (DependentTerm <$> (try (depend_group <* (spaces <* string "=>") <* spaces)) <*> independent)
@@ -773,9 +789,11 @@ add_partial_structs (Namespace namsp subspaces typeclasses data_structs aliases 
 
 --semantic_pass :: Program -> Either String AST
 semantic_pass (Program mods (Namespace name subspaces typeclasses structs aliases terms)) =
-    let term_map = (collect terms termName)
-        struct_map = (collect structs structName)
-    in foldl (\acc x -> acc >>= (pass_term x)) (Right (term_map, struct_map)) terms
+    let (complete, generic) = partition_datas structs
+        ctors = extract_ctors structs
+        term_map = (collect terms termName)
+        env = Env term_map ctors complete generic []
+    in foldl (\acc x -> acc >>= (pass_term x)) (Right env) terms
   where collect :: [a] -> (a -> String) -> Lookup a
         collect xs getName = foldl (\lkup x -> Map.insert (getName x) x lkup) Map.empty xs
 
@@ -787,49 +805,67 @@ semantic_pass (Program mods (Namespace name subspaces typeclasses structs aliase
         structName (Product nam _ _) = nam
         structName (Sum nam _ _) = nam
 
-pass_term :: Term -> (Lookup Term, Lookup Data) -> Either String (Lookup Term, Lookup Data)
-pass_term trm pair@(term_map, struct_map) =
-    (\sm -> case sm of
-                 Right x -> Right (term_map, x)
-                 Left e -> Left e
-    )
-    (case trm of
-         Term typ nam lams -> validate_type typ struct_map
-         (DependentTerm deps (Term typ nam lams)) -> validate_type typ struct_map)
+        partition_datas :: [Data] -> (Lookup Data, Lookup Data)
+        partition_datas xs = foldl split_structs (Map.empty, Map.empty) xs
 
-validate_type :: Type -> Lookup Data -> Either String (Lookup Data)
-validate_type typ tabl =
+        split_structs :: (Lookup Data, Lookup Data) -> Data -> (Lookup Data, Lookup Data)
+        split_structs (a,b) dat@(Sum name [] membs) = (Map.insert name dat a, b)
+        split_structs (a,b) dat@(Product name [] membs) = (Map.insert name dat a, b)
+        split_structs (a,b) dat@(Sum name _ membs) = (a, Map.insert name dat b)
+        split_structs (a,b) dat@(Product name _ membs) = (a, Map.insert name dat b)
+
+        extract_ctors :: [Data] -> Lookup [Ctor]
+        extract_ctors xs = foldl pull_ctors Map.empty xs
+
+pull_ctors :: Lookup [Ctor] -> Data -> Lookup [Ctor]
+pull_ctors lkup dat@(Sum name [] membs) = Map.insert name [build_ctor_type [] dat]
+pull_ctors lkup (Product name [] membs) = Map.insert name (foldl build_ctor_type [] membs) lkup
+pull_ctors lkup _ = lkup
+
+build_ctor_type :: [Ctor] -> Data -> [Ctor]
+build_ctor_type ctors dat = (Ctor dat):ctors
+
+pass_term :: Term -> Env -> Either String Env
+pass_term trm env@(Env terms ctors comp_structs gen_structs symbols) =
+    env >>= (case trm of
+                  Term typ nam lams -> validate_type typ
+                  DependentTerm deps (Term typ nam lams) -> validate_type typ)
+
+user_type_to_struct_name :: Type -> Maybe CustomType
+user_type_to_struct_name (UsrType name []) = Just name
+user_type_to_struct_name (UsrType name gens) = Just $ intercalate "[GN]" [name, intercalate "[GN]" $ map user_type_to_struct_name gens]
+user_type_to_struct_name _ = Nothing
+
+validate_type :: Type -> Env -> Either String Env
+validate_type typ env =
     case typ of
-         (TermType a b) -> validate_type a tabl >>= validate_type b
-         (Array t) -> validate_type t tabl -- TODO create new array type in tabl if needed
-         (UsrType _ _) -> validate_usr_type typ tabl
-         _ -> Right tabl -- TODO extern unimplemented
-  where validate_usr_type :: Type -> Lookup Data -> Either String (Lookup Data)
-        validate_usr_type (UsrType name gens) lkup =
-            let validator = validate_generics lkup name gens
-            in case Map.lookup name lkup of
-                 Just struct@(Product _ g _) -> validator g struct
-                 Just struct@(Sum _ g _) -> validator g struct
-                 _ -> Left $ "No data type defined with name: " ++ name
+         (TermType a b) -> validate_type a env >>= validate_type b
+         (Array t) -> validate_type t env                                                     -- TODO create new array type in tabl if needed
+         (UsrType _ _) -> validate_usr_type typ env
+         _ -> Right env                                                                       -- TODO extern unimplemented
+  where validate_usr_type :: Type -> Env -> Either String Env
+        validate_usr_type typ@(UsrType name gens) env@(Env _ _ comp gen _) =
+            let tr_name = user_type_to_struct_name typ
+                validator = validate_generics tr_name typ
+            case Map.lookup tr_name comp of
+                 Nothing -> case Map.lookup name gen of
+                                 Just mold@(Product _ g membs) -> env >>= validator mold g membs 
+                                 Just mold@(Sum _ g membs) -> env >>= validator mold g membs
+                                 _ -> Left $ "No data type defined with name" ++ name
+                 _ -> Right env
 
-        validate_generics :: Lookup Data -> String -> [Type] -> Generics -> Data -> Either String (Lookup Data)
-        validate_generics lkup name gens g mold =
+        validate_generics :: CustomType -> Type -> Data -> [CustomType] -> [Data] -> Env -> Either String Env
+        validate_generics tr_name typ@(UsrType name gens) mold g membs env@(Env ts cts comp incomp st) =
             let attempt = length gens
                 real = length g
             in if attempt == real
-            then case foldl (>>=) (Right lkup) $ map validate_type gens of
-                      Right valid -> (\new_name ->
-                          case Map.lookup new_name lkup of
-                               Just _ -> Right lkup
-                               Nothing -> Right $ Map.insert new_name (forge_struct mold gens new_name) lkup) $ rename_struct name gens
+            then case foldl (>>=) (Right env) $ map validate_type gens of
+                      Right valid -> (\new_struct -> Right $ Env ts (pull_ctors cts new_struct) (Map.insert tr_name new_struct comp) incomp st) $ forge_struct mold gens tr_name
                       error -> error
             else Left $ concat ["data type ",name," requires ",show real
                                ," generic type arguments, but ",show attempt
                                ," were provided.\nExpecting: ",show g
                                ,"\nRecieved: ",show gens]
-
-        rename_struct :: String -> [Type] -> String
-        rename_struct old_name params = concat $ [old_name,"[GN]",concat $ map type_name params]
 
         forge_struct :: Data -> [Type] -> String -> Data
         forge_struct data_struct params new_name =
@@ -853,8 +889,113 @@ validate_type typ tabl =
                     else get_new_type ps cs cand
                 get_new_type _ _ _ = Nothing
 
-        type_name :: Type -> String
-        type_name (UsrType name _) = name
+-- Type validated, new types added to complete, ctors added to ctors, go through lambda arguments now and add to scope as you go
+
+pass_lambda :: Type -> Lambda -> Env -> Either String Env
+pass_lambda t (Lambda args expr) env@(Env term_map struct_map type_map symbols) = Right env
+
+validate_args :: Type -> [Pattern] -> Env -> Either String Env
+validate_args t (ar:args) env =
+    case t of
+         TermType a b -> case type_to_data a of
+                              Just dat -> add_scope_pattern_arg dat ar env >>= (validate_args b args)
+                              Nothing -> Left $ concat ["No definition found for type ", show a, " in argument."]
+         _ -> Left $ concat ["Extra argument ",show ar," passed in function."]
+validate_args t [] env = Right env
+
+add_to_scope :: String -> Type -> Env -> Either String Env
+add_to_scope name typ (Env t s ty scope) =
+    case Map.lookup name scope of
+         Just var -> Left $ concat ["Duplicate declaration of ", name," as type ", show typ, ". Previous declaration was: ", show var]
+         Nothing -> Right $ Env t s ty $ Map.insert nam typ scope
+
+-- TODO add stuff to scope
+add_scope_pattern_arg :: Data -> Pattern -> Env -> Either String Env
+add_scope_pattern_arg t pat@(Shape subs@((TypeAnchor type_name):rest)) env@(Env terms structs types _) =
+    case t of
+         Sum name gens membs -> if type_name == name
+                                then foldl (\acc (m, r) -> acc >>= add_scope_pattern_arg m r) (Right env) $ zip membs rest
+                                else Left $ concat ["No valid type ",type_name," found in pattern ",show pat]
+         Product name gens membs -> foldl (\acc x -> acc <|> add_scope_pattern arg m pat env) (Left "") membs
+         _ -> Left $ concat ["Tried to match structure pattern arg ",show pat," to non structure type ",show t]
+add_scope_pattern_arg t (Shape [single]) env = add_scope_pattern_arg t single env
+add_scope_pattern_arg t pat@(Shape other) env =
+    Left $ concat ["multiple arguments passed to shape ", show pat," matching on non structure argument: ",show t]
+add_scope_pattern_arg t (ReferenceShape name pat) env =
+    case data_to_type t of
+         Just typ -> add_scope_pattern_arg t pat env >>= (add_to_scope name typ env)
+         Nothing -> Left $ concat ["No type deducible for structure or union ", show t, " in reference shape argument."]
+add_scope_pattern_arg t anch@(TypeAnchor name) (Env terms structs types _) =
+    Left $ concat ["I didnt think a lone type anchor was possible, tried to match ", show anch," on ", show t]
+add_scope_pattern_arg t (LitAnchor lit) env@(Env terms structs types _) =
+    let err_str typ = concat ["Couldn't match ",typ," literal ", show lit, " with type ", show t]
+    in case lit of
+            Integral int -> if is_integral t then Right env else Left $ err_str "integer"
+            Float dbl -> if is_floating t then Right env else Left $ err_str "float"
+            Boolean bl -> if is_boolean t then Right env else Left $ err_str "Boolean"
+            CharString str ->
+                case t of
+                     Record (UsrType String _) _ -> Right env
+                     _ -> Left $ err_str "String"
+            CharSingle ch ->
+                case t of
+                     Record Chr _ -> Right env
+                     _ -> Left $ err_str "Character"
+            ArrayLiteral exprs ->
+                case t of
+                     Record arr@(Array inner) _ -> case type_to_data inner env of
+                                                        Just dat -> foldl (\acc x -> acc >>= (valid_arg_literal dat x)) (Right env) exprs
+                                                        Nothing -> Left $ concat ["No definition found for type ", show inner, " in array argument."]
+                     _ -> Left $ err_str $ show arr
+  where is_integral :: Data -> Bool
+        is_integral (Record I8 _) = True
+        is_integral (Record I16 _) = True
+        is_integral (Record I32 _) = True
+        is_integral (Record I64 _) = True
+        is_integral (Record U8 _) = True
+        is_integral (Record U16 _) = True
+        is_integral (Record U32 _) = True
+        is_integral (Record U64 _) = True
+        is_integral _ = False
+
+        is_floating :: Data -> Bool
+        is_foating F32 = True
+        is_foating F64 = True
+        is_foating _ = False
+
+        valid_arg_literal :: Data -> Expression -> Env -> Either String Env
+        valid_arg_literal t (LiteralPattern pat) = add_scope_pattern_arg t pat env
+        valid_arg_literal t (BoundName n) = Right env
+        valid_arg_literal other = Left $ concat ["Invalid literal for array argument pattern: ", show other]
+add_scope_pattern_arg t (ArrayPattern subpatterns) env@(Env terms structs types _) =
+    case t of
+         Record arr@(Array inner) _ -> case type_to_data inner env of
+                                            Just dat -> foldl (\acc pat -> acc >>= (add_scope_pattern_arg dat pat env)) (Right env) subpatterns
+                                            Nothing -> Left $ concat ["No definition found for type ", show inner ," in array argument"]
+         _ -> Left $ concat ["Tried to match array pattern argument with expected type: ", show t]
+add_scope_pattern_arg t (Anchor name) env@(Env terms structs types _) = Right env
+add_scope_pattern_arg _ _ _ = Left "Invalid type or extern"
+
+-- TODO add new data types when new struct members are added to lookup (requires reshaping validate type to using then entire env rather than just Lookup Data)
+-- TODO tagged union subtypes are not deducible, map subname -> data, function to subname -> maybe data, function to do subname -> maybe type
+-- TODO add the rest of stuff to scope in arg check
+--      array elements
+--      really just any bound names
+
+type_to_data :: Type -> Env -> Maybe Data
+type_to_data (UsrType n _) (Env trm strct tp _) = Map.lookup t strct
+type_to_data t _ -> Just $ Record t ""
+
+data_to_type :: Data -> Env -> Maybe Type
+data_to_type dat (Env trm strct tp _) =
+    case dat of
+         Record t _ -> Just t
+         Product name [] membs -> Map.lookup name tp
+         Sum name [] membs -> Map.lookup name tp
+         _ -> Nothing
+
+pass_expression :: Expression -> Env -> Either String Env
+pass_expression _ env = Right env -- TODO
 
 analysis :: Program -> Either String Program
 analysis (Program mods global) =
