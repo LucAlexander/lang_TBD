@@ -64,7 +64,6 @@ data Type = TermType Type Type
           | U8 | U16 | U32 | U64
           | F32 | F64
           | Chr
-          | Bl
           | Array Type
           | UsrType CustomType [Type]
           | ExternType [CustomType] Type
@@ -83,7 +82,6 @@ instance Show Type where
     show F32 = "f32"
     show F64 = "f64"
     show Chr = "chr"
-    show Bl = "bl"
     show (Array a) = concat ["[",show a,"]"]
     show (UsrType a []) = a
     show (UsrType a ag) = intercalate "[GN]" [a, intercalate "[GN]" $ map show ag]
@@ -106,7 +104,6 @@ data Definition = TermDef Term
 
 data Literal = Integral Int
              | Float Double
-             | Boolean Bool
              | CharString String
              | ArrayLiteral [Expression]
              | CharSingle Char deriving (Show)
@@ -162,7 +159,6 @@ type_atom = primitive
         extern = try (ExternType <$> many1 (try (adt_name <* string "::")) <*> custom)
         primitive :: Parsec String () Type
         primitive = Chr <$ (try $ string "char")
-                <|> Bl <$ (try $ string "bool")
                 <|> F64 <$ (try $ string "double")
                 <|> F32 <$ (try $ string "float")
                 <|> I8 <$ (try $ string "int8")
@@ -211,8 +207,7 @@ comment = (try $ string "//" *> (many anyChar) <* char '\n')
       <|> (try $ string "/*" *> (many anyChar) <* string "*/")
 
 literal :: Parsec String () Literal
-literal = (Boolean . to_bool <$> ((string "True") <|> (string "False")))
-      <|> (CharString <$> try (char '"' *> many charac <* char '"'))
+literal = (CharString <$> try (char '"' *> many charac <* char '"'))
       <|> (CharSingle <$> try (char '\'' *> anyChar <* char '\''))
       <|> (Float <$> try (ap sign floating))
       <|> (Integral <$> try int)
@@ -967,7 +962,6 @@ validate_literal_type t (Integral i) env =
          _ -> Left $ concat ["Tried to match integral literal ", show i, " with non integral type ", show t]
 validate_literal_type F64 (Float _) env = Right env
 validate_literal_type F32 (Float _) env = Right env
-validate_literal_type Bl (Boolean _) env = Right env
 validate_literal_type (UsrType "String" []) (CharString _) env = Right env
 validate_literal_type Chr (CharSingle _) env = Right env
 validate_literal_type (Array _) (ArrayLiteral []) env = Right env
@@ -1050,7 +1044,6 @@ c_member_type_generator :: Generator Type
 c_member_type_generator t =
     case t of
          Chr -> "char"
-         Bl -> "uint8_t"
          F64 -> "double"
          F32 -> "float"
          I8 -> "int8_t"
