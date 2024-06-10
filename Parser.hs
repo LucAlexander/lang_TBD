@@ -67,7 +67,7 @@ data Type = TermType Type Type
           | Array Type
           | UsrType CustomType [Type]
           | ExternType [CustomType] Type
-          | TypeErr String
+          | TypeErr String deriving (Eq)
 
 instance Show Type where
     show (TermType a b) = concat [show a," -> ", show b]
@@ -115,7 +115,8 @@ data Env = Env {
     constructors :: Lookup [Ctor],
     complete_structs :: Lookup Data,
     generic_structs :: Lookup Data,
-    symbol_table :: Lookup Store
+    symbol_table :: Lookup Store,
+    constraints :: Lookup [CustomType]
 }
 
 data Store = Store Type Binding
@@ -810,7 +811,7 @@ semantic_pass (Program mods (Namespace name subspaces typeclasses structs aliase
     let (complete, generic) = partition_datas structs
         ctors = extract_ctors structs
         term_map = (collect terms termName)
-        env = Env term_map ctors complete generic Map.empty
+        env = Env term_map ctors complete generic Map.empty Map.empty
     in foldl (\acc x -> acc >>= (pass_term x)) (Right env) terms
   where collect :: [a] -> (a -> String) -> Lookup a
         collect xs getName = foldl (\lkup x -> Map.insert (getName x) x lkup) Map.empty xs
@@ -844,12 +845,21 @@ build_ctor_type :: [Ctor] -> Data -> [Ctor]
 build_ctor_type ctors dat = (Ctor dat):ctors
 
 pass_term :: Term -> Env -> Either String Env
-pass_term trm env =
+pass_term trm env@(Env _ _ _ _ start_scope _) =
     case trm of
          Term typ nam lams -> foldl (>>=) (validate_type typ env) $ map (\l -> \e -> (pass_lambda typ l e) >>= reset_scope) lams
-         DependentTerm deps inner -> pass_term inner env
+         DependentTerm deps inner -> add_constraints deps env >>= (pass_term inner)
   where reset_scope :: Env -> Either String Env
-        reset_scope (Env terms ctors comps incomps symbols) = Right $ Env terms ctors comps incomps Map.empty
+        reset_scope (Env terms ctors comps incomps _ constr) = Right $ Env terms ctors comps incomps start_scope constr
+
+add_constraints :: [(CustomType, CustomType)] -> Env -> Either String Env
+add_constraints constr (Env terms ctors comps incomps symbols constraints) =
+    Right $ Env terms ctors comps incomps symbols $ foldl (\acc (cl, gn) -> add_to_lookup cl gn acc) constraints constr
+  where add_to_lookup :: CustomType -> CustomType -> Lookup [CustomType] -> Lookup [CustomType]
+        add_to_lookup typeclass generic_name constrs =
+            case Map.lookup generic_name constrs of
+                 Just x -> Map.insert generic_name (typeclass:x) constrs
+                 Nothing -> Map.insert generic_name [typeclass] constrs
 
 validate_type :: Type -> Env -> Either String Env
 validate_type typ env =
@@ -860,7 +870,7 @@ validate_type typ env =
          _ -> Right env                                                                       -- TODO extern unimplemented
   where validate_usr_type :: Type -> Env -> Either String Env
         validate_usr_type (UsrType _ []) env = Right env
-        validate_usr_type typ@(UsrType name gens) env@(Env _ _ comp gen _) =
+        validate_usr_type typ@(UsrType name gens) env@(Env _ _ comp gen _ _) =
             let tr_name = show typ
                 validator = validate_generics tr_name typ
             in case Map.lookup tr_name comp of
@@ -871,12 +881,12 @@ validate_type typ env =
                     _ -> Right env
 
         validate_generics :: CustomType -> Type -> Data -> [CustomType] -> [Data] -> Env -> Either String Env
-        validate_generics tr_name typ@(UsrType name gens) mold g membs env@(Env ts cts comp incomp st) =
+        validate_generics tr_name typ@(UsrType name gens) mold g membs env@(Env ts cts comp incomp st cstr) =
             let attempt = length gens
                 real = length g
             in if attempt == real
             then case foldl (>>=) (Right env) $ map validate_type gens of
-                      Right valid -> (\new_struct -> Right $ Env ts (pull_ctors cts new_struct) (Map.insert tr_name new_struct comp) incomp st) $ forge_struct mold gens tr_name
+                      Right valid -> (\new_struct -> Right $ Env ts (pull_ctors cts new_struct) (Map.insert tr_name new_struct comp) incomp st cstr) $ forge_struct mold gens tr_name
                       error -> error
             else Left $ concat ["data type ",name," requires ",show real
                                ," generic type arguments, but ",show attempt
@@ -906,7 +916,11 @@ validate_type typ env =
                 get_new_type _ _ _ = Nothing
 
 pass_lambda :: Type -> Lambda -> Env -> Either String Env
-pass_lambda t (Lambda args expr) env@(Env terms ctors comps incomps symbols) = validate_args t args env >>= (pass_expression expr)
+pass_lambda t (Lambda args expr) env@(Env terms ctors comps incomps symbols constr) = validate_args t args env >>= (pass_expression (return_type args t) expr)
+
+return_type :: [Pattern] -> Type -> Type
+return_type [] t = t
+return_type (arg:args) (TermType a b) = return_type args b
 
 validate_args :: Type -> [Pattern] -> Env -> Either String Env
 validate_args (TermType a b) (arg:args) env = check_arg a arg env >>= (validate_args b args)
@@ -927,7 +941,7 @@ check_arg typ@(TermType _ _) pat env = Left $ concat ["Cannot bind function type
 check_arg typ pat env = Left $ concat ["Cannot match expected type ", show typ, " with provided argument pattern ", show pat]
 
 validate_ctor_shape :: CustomType -> CustomType -> [Pattern] -> Env -> Either String Env
-validate_ctor_shape name ctor membs env@(Env terms ctors comps incomps symbols) = 
+validate_ctor_shape name ctor membs env@(Env terms ctors comps incomps symbols constr) = 
      case Map.lookup name ctors of
           Just ctor_list ->
               case get_ctor ctor ctor_list of
@@ -943,10 +957,10 @@ get_ctor target ((Ctor inner@(Sum name _ membs)):cs) = if target == name then Ju
 get_ctor target [] = Nothing
 
 add_to_scope :: Type -> Binding -> Env -> Either String Env
-add_to_scope t n env@(Env terms ctors comps incomps symbols) =
+add_to_scope t n env@(Env terms ctors comps incomps symbols constr) =
     case Map.lookup n symbols of
          Just (Store old_type _) -> Left $ concat ["Redefinition in scope of ", show n, " originally bound to type ", show old_type, " newly defined as ", show t]
-         Nothing -> Right $ Env terms ctors comps incomps $ Map.insert n (Store t n) symbols
+         Nothing -> Right $ Env terms ctors comps incomps (Map.insert n (Store t n) symbols) constr
 
 validate_literal_type :: Type -> Literal -> Env -> Either String Env
 validate_literal_type t (Integral i) env =
@@ -972,8 +986,103 @@ validate_literal_type (Array t) (ArrayLiteral membs) env = foldl (>>=) (Right en
         is_literal_arg expr_arg _ = Left $ concat ["Passed non pattern expression in array member literal ", show expr_arg]
 validate_literal_type typ lit _ = Left $ concat ["Couldnt match argument pattern literal ", show lit, " with type ", show typ]
 
-pass_expression :: Expression -> Env -> Either String Env -- TODO generic constraint dependencies are not logged, and therefore cannot be used in this pass
-pass_expression _ env = Right env -- TODO
+deduce_type :: Binding -> Env -> Either String Type
+deduce_type binding (Env terms _ _ _ symbols _) =
+    case in_scope of
+         Right x -> Right x
+         Left x -> case in_terms of
+                        Right y -> Right y
+                        Left y -> Left y
+  where in_scope :: Either String Type
+        in_scope = case Map.lookup binding symbols of
+                        Just (Store t _) -> Right t
+                        Nothing -> Left $ "No symbol in scope named " ++ binding
+
+        in_terms :: Either String Type
+        in_terms = case Map.lookup binding terms of
+                        Just (Term t _ _) -> Right t
+                        Just (DependentTerm _ (Term t _ _)) -> Right t
+                        Nothing -> Left $ "No term in scope named " ++ binding
+
+pass_expression :: Type -> Expression -> Env -> Either String Env
+pass_expression t (Closure term@(Term typ name lams)) env = pass_term term env >>= (add_to_scope typ name)
+pass_expression t (Closure term@(DependentTerm _ (Term typ name lams))) env = pass_term term env >>= (add_to_scope typ name)
+pass_expression t ex env =
+    case resulting_type ex env of
+         Right actual -> if t == actual
+                         then Right env >>= (descend ex)
+                         else Left $ concat ["Expression ", show ex, " returned ", show actual, " when it was expected to return ", show t, " by its term."]
+  where descend :: Expression -> Env -> Either String Env
+        descend (Application a b) env = type_checker a env >>= (type_checker b)
+        descend (Anonymous lam) env = Left "lambdas unimplemented"
+        descend (Return expr) env = type_checker expr env
+        descend (Block scope) env = Left "block unimplemented"
+        descend (If pred cond alt) env = type_checker pred env >>= (type_checker cond) >>= (type_checker alt)
+        descend (Else alt) env = type_checker alt env
+        descend (Case pred matches) env = foldl (>>=) (type_checker pred env) $ map (\(Match _ expr) -> type_checker expr) matches
+        descend _ env = Right env
+  
+        type_checker :: Expression -> Env -> Either String Env
+        type_checker ex env = pass_expression t ex env
+
+resulting_type :: Expression -> Env -> Either String Type
+resulting_type (Closure (Term typ _ _)) env =
+    case typ of
+         TermType a b -> Right b
+         x -> Right x
+resulting_type (Closure term@(DependentTerm _ trm)) env = resulting_type (Closure trm) env
+resulting_type (Application a b) env =
+    case (resulting_type a env, resulting_type b env) of
+         (Right l@(TermType x y), Right r) ->
+             if x == r
+             then Right y
+             else Left $ concat ["Mismatched type in application (", show a, ") (", show b, ") types: (", show l,") (", show r, ")"] 
+         _ -> Left $ concat ["cannot apply ", show a, " with ", show b]
+resulting_type (Anonymous lam) env = Left "Lambdas unimplemented"
+resulting_type (BoundName binding) env = deduce_type binding env
+resulting_type (BoundOperator binding) env = deduce_type binding env
+resulting_type (StructAccess binding) env = Left "struct access unimplemented"
+resulting_type (NamespaceAccess chain binding) env = Left "NamespaceAccess unimplemented"
+resulting_type (Return expr) env = resulting_type expr env
+resulting_type (Block scope) env = Left "Blocks unimplemented"
+resulting_type (If pred cond alt) env =
+    let c = resulting_type cond env
+        a = resulting_type alt env
+    in case resulting_type pred env of
+            Right (UsrType "Bool" []) ->
+                case (c, a) of
+                     (Right c_type, Right a_type) -> if c_type == a_type
+                                                     then c
+                                                     else Left "Mismatch conditional"
+                     (Left _, _) -> c
+                     _ -> a
+            other -> Left $ concat ["Expected predicate ", show pred, " to be of type Bool, instead was of type, ", show other]
+resulting_type (Else alt) env = resulting_type alt env
+resulting_type (Case pred matches) env =
+    case resulting_type pred env of
+         Right (TermType _ _) -> Left $ concat ["Cannot match on term type ", show pred]
+         Right t -> cases_match matches t
+         Left other -> Left other
+  where cases_match :: [Match] -> Type -> Either String Type
+        cases_match matches t = 
+            case foldl (>>=) (Right env) $ map (\(Match p _) -> check_arg t p) matches of
+                 Right _ -> types_match $ map match_type matches
+                 Left x -> Left x
+
+        match_type :: Match -> Either String Type
+        match_type (Match pat expr) = resulting_type expr env
+
+        types_match :: [Either String Type] -> Either String Type
+        types_match ((Left x):xs) = Left x
+        types_match (_:(Left x):xs) = Left x
+        types_match (acc@(Right x):(Right y):xs) =
+            if x==y
+            then types_match $ acc:xs
+            else Left "Mismatch match"
+        types_match [x] = x
+        types_match [] = Left "No matches given, no type deducible"
+resulting_type (LiteralPattern pat) env = Left "literals unimplemented"
+resulting_type (Nop) env = Left "nop"
 
 analysis :: Program -> Either String Program
 analysis (Program mods global) =
